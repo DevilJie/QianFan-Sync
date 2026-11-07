@@ -196,10 +196,17 @@
       width="60%"
       :top="'8vh'"
       class="preview-dialog"
+      destroy-on-close
+      @close="stopPreviewPlayback"
     >
       <div class="preview-container" v-if="currentMaterial">
         <div v-if="currentMaterial.file_type === 'video'" class="video-preview">
-          <video :src="getFullUrl(currentMaterial)" controls autoplay />
+          <video
+            ref="previewVideoRef"
+            :src="getFullUrl(currentMaterial)"
+            controls
+            autoplay
+          />
         </div>
         <div v-else class="image-preview">
           <img :src="getFullUrl(currentMaterial)" :alt="currentMaterial.original_filename" />
@@ -268,6 +275,7 @@ const hasFilter = computed(
 const uploadDialogVisible = ref(false)
 const previewDialogVisible = ref(false)
 const currentMaterial = ref(null)
+const previewVideoRef = ref(null)
 
 // 批量选择
 const selectMode = ref(false)
@@ -369,6 +377,16 @@ function formatDate(iso) {
 function openPreview(mat) {
   currentMaterial.value = mat
   previewDialogVisible.value = true
+}
+
+// el-dialog 默认只隐藏不卸载，<video> 会在弹窗关掉后继续出声。
+// close 在离场动画开始前触发，此时节点还在，先停播并释放媒体资源。
+function stopPreviewPlayback() {
+  const video = previewVideoRef.value
+  if (!video) return
+  video.pause()
+  video.removeAttribute('src')
+  video.load()
 }
 
 // 上传素材
