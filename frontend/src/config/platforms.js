@@ -458,8 +458,9 @@ export const PLATFORMS = {
           { label: '请理性适度消费', value: '请理性适度消费' },
           { label: '未成年人请在监护人指导下浏览', value: '未成年人请在监护人指导下浏览' },
         ] },
+      { key: 'scheduleTime', label: '定时发布', type: 'datetime', placeholder: '选择日期时间' },
     ],
-    defaultSettings: { title: '', description: '', videoType: '', weiboCategory: [], contentStatement: '', contentStatement2: '', contentStatement2Optional: '' },
+    defaultSettings: { title: '', description: '', videoType: '', weiboCategory: [], contentStatement: '', contentStatement2: '', contentStatement2Optional: '', scheduleTime: '' },
   },
   ALIPAY: {
     id: 12,

@@ -383,7 +383,10 @@ class WeiboPlatform(BasePlatform):
           ``[channel_name, sub_name]``;也兼容 ``"channel|sub"`` 字符串
         - ``ai_content`` (*str*, optional) -- 类型声明(原创/二创/转载)
 
-        V1 暂不支持定时发布;``schedule_time_str`` 等参数被忽略。
+        - ``enableTimer`` (*bool*, optional)
+        - ``schedule_time_str`` (*str*, optional) -- 定时发布时间
+          (``YYYY-MM-DD HH:mm[:ss]``, 今天~今天+7 天; 仅已获定时发布权限的
+          账号可用, 设置失败直接报错, 不会静默退回立即发布)
         """
         asyncio.run(self._upload_all(**kwargs))
         return True
@@ -827,6 +830,9 @@ class WeiboPlatform(BasePlatform):
         content_statement2 = kwargs.get("content_statement2", "") or ""
         content_statement2_optional = kwargs.get("content_statement2_optional", "") or ""
         weibo_collection = kwargs.get("weibo_collection", "") or ""
+        # 定时发布(2026-11-08 起账号侧支持;此前 V1 忽略该参数)
+        enable_timer = bool(kwargs.get("enableTimer", False))
+        schedule_time_str = kwargs.get("schedule_time_str", "") or ""
 
         # 打印发布参数摘要
         logger.info("[发布参数] 标题: %s", title)
@@ -840,7 +846,10 @@ class WeiboPlatform(BasePlatform):
         logger.info("[发布参数] 类型声明: %s", ai_content or "无")
         logger.info("[发布参数] 内容声明: %s", content_statement or "无")
         logger.info("[发布参数] 微博合集: %s", weibo_collection or "无")
-        logger.info("[发布策略] 发布策略: immediate")
+        logger.info(
+            "[发布策略] 发布策略: %s",
+            f"scheduled({schedule_time_str})" if enable_timer and schedule_time_str else "immediate",
+        )
 
         account_paths = [
             str(Path(BASE_DIR / "cookiesFile") / f) for f in account_file
@@ -875,6 +884,8 @@ class WeiboPlatform(BasePlatform):
                         content_statement2=content_statement2,
                         content_statement2_optional=content_statement2_optional,
                         weibo_collection=weibo_collection,
+                        enable_timer=enable_timer,
+                        schedule_time_str=schedule_time_str,
                     )
 
         logger.info("=" * 60)
@@ -902,6 +913,8 @@ class WeiboPlatform(BasePlatform):
         content_statement2="",
         content_statement2_optional="",
         weibo_collection="",
+        enable_timer=False,
+        schedule_time_str="",
     ):
         """Upload a single video to one Weibo account."""
         browser = await self.create_browser(headless=False)
@@ -1012,6 +1025,12 @@ class WeiboPlatform(BasePlatform):
                 await self._set_content_statement(
                     page, content_statement, content_statement2, content_statement2_optional
                 )
+
+                # 定时发布(账号需已获定时权限;设置失败必须报错,
+                # 防止「想定时却立即发出去」的事故)
+                if schedule_time_str:
+                    logger.info("[定时发布] 开始设置定时发布: %s", schedule_time_str)
+                    await self._set_schedule_time(page, schedule_time_str)
 
                 # 点发布
                 logger.info("[发布] 正在点击发布按钮...")
@@ -1834,7 +1853,9 @@ class WeiboPlatform(BasePlatform):
 
         前端用 3 个独立下拉分别承载两套声明,后端探测到哪种 UI 就用对应那套值:
         - 版本1 UI → 用 v1_stmt
-        - 版本2 UI → 用 v2_required(必选) + v2_optional(可选)
+        - 版本2 UI → 用 v2_required(必选) + v2_optional(可选);
+          v2_required 未设置时按声明1 的值近义映射自动补全
+          (转载/AI/虚构演绎 直接对应,自主创作→内容无需标注)
 
         Args:
             v1_stmt: 版本1 声明值(5 选 1,或「无」/空=不设置)。
@@ -1842,6 +1863,26 @@ class WeiboPlatform(BasePlatform):
                 时点「内容无需标注」(必选区必须选一个)。
             v2_optional: 版本2「可选」区声明值。空=不选。
         """
+        # 声明1 → 声明2 近义映射:声明2 未设置且声明1 已选时,把声明1 的值
+        # 映射到声明2 直接选上(MCP/前端只传声明1 也能覆盖版本2 UI 账号)。
+        # 「内容为自主创作」在声明2 无对应项,归入「内容无需标注」。
+        _V1_TO_V2_MAP = {
+            "无": "内容无需标注",
+            "内容无需标注": "内容无需标注",
+            "内容为自主创作": "内容无需标注",
+            "内容为转载": "内容为转载",
+            "内容由AI生成": "含AI生成内容",
+            "内容为虚构演绎": "含虚构演绎内容",
+        }
+        if not v2_required and v1_stmt:
+            mapped = _V1_TO_V2_MAP.get(v1_stmt.strip())
+            if mapped:
+                logger.info(
+                    "[内容声明] 声明2 未设置,按声明1「%s」自动映射为「%s」",
+                    v1_stmt, mapped,
+                )
+                v2_required = mapped
+
         # 先探测版本2 trigger「请进行内容声明（必填）」是否存在
         # 注意:不能用 exact=True,实际 DOM 文本可能含全角括号或前后空白,
         # 用 contains 匹配更稳。探测全程打日志,绝不静默吞异常。
@@ -2039,6 +2080,122 @@ class WeiboPlatform(BasePlatform):
     # ------------------------------------------------------------------
     # Helper: click 发布 button
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Helper: 定时发布(2026-11-08 踩点实证)
+    # ------------------------------------------------------------------
+
+    # 定时发布可选日期范围: 今天 ~ 今天+7 天(与平台 date-picker 禁用规则一致)
+    _VIDEO_TIMING_MAX_DAYS = 7
+
+    @staticmethod
+    async def _set_schedule_time(page, schedule_time_str: str):
+        """设置视频定时发布时间。
+
+        DOM(2026-11-08 踩点实证, weibo.com/upload/channel 视频表单):
+          - 定时开关图标: div[class*='_timer_'](内含 svg use
+            #woo_svg_nav_timer, 带 NEW 角标; 仅已获定时发布权限的账号显示),
+            点击在「设置微博内容」区展开定时面板
+          - 面板: 「发布时间」label + span.wbpro-datapicker > input
+            (日期, value 'YYYY/MM/DD', 默认今天) + 两个 vue-multiselect
+            (第一个=时, 第二个=分, .multiselect__single 显示「N 时/ M 分」,
+            默认 server_time+15min) + 「剩余 N 次」(每日定时次数限制)
+          - 日期可选范围: 今天 ~ 今天+7 天, 分钟精度
+
+        语义安全: 设置失败直接抛异常 —— 绝不能静默退回立即发布,
+        否则会造成「想定时却立即发出去」的事故。
+        """
+        from datetime import datetime as _dt, timedelta as _td
+
+        target = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                target = _dt.strptime(schedule_time_str.strip(), fmt)
+                break
+            except ValueError:
+                continue
+        if target is None:
+            raise ValueError(f"定时发布时间格式无法解析: {schedule_time_str!r}")
+
+        # 日期范围校验(与平台 date-picker 可选范围一致)
+        today = _dt.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        tday = target.replace(hour=0, minute=0, second=0, microsecond=0)
+        if tday < today or tday > today + _td(days=WeiboPlatform._VIDEO_TIMING_MAX_DAYS):
+            raise ValueError(
+                "定时发布时间超出可选范围(今天 ~ 今天+"
+                f"{WeiboPlatform._VIDEO_TIMING_MAX_DAYS} 天): {schedule_time_str}"
+            )
+
+        # 1. 展开定时面板(「发布时间」文本可见 = 已展开)
+        if not await page.get_by_text("发布时间", exact=True).first.is_visible():
+            timer_icon = page.locator("div[class*='_timer_']").first
+            if not await timer_icon.count():
+                raise RuntimeError(
+                    "微博视频发布页未找到定时发布入口"
+                    "(该账号可能未获得定时发布权限, 请先在平台确认)"
+                )
+            await timer_icon.scroll_into_view_if_needed()
+            await timer_icon.click()
+            await asyncio.sleep(2)
+            if not await page.get_by_text("发布时间", exact=True).first.is_visible():
+                await page.screenshot(
+                    path=str(Path(BASE_DIR / "logs" / "weibo_schedule_open_fail.png")),
+                    full_page=True,
+                )
+                raise RuntimeError("点击定时图标后定时面板未展开")
+
+        # 2. 日期(vue2 datepicker 输入框, 'YYYY/MM/DD')
+        date_input = page.locator("span.wbpro-datapicker input").first
+        if not await date_input.count():
+            raise RuntimeError("未找到定时发布日期输入框")
+        want_date = target.strftime("%Y/%m/%d")
+        cur_date = (await date_input.input_value() or "").strip()
+        if cur_date != want_date:
+            await date_input.click()
+            await date_input.fill(want_date)
+            await asyncio.sleep(0.5)
+            now_date = (await date_input.input_value() or "").strip()
+            if now_date != want_date:
+                raise RuntimeError(
+                    f"定时日期设置失败: 期望 {want_date}, 实际 {now_date or '(空)'}"
+                )
+
+        # 3. 时 / 分(vue-multiselect: 点开下拉 → 点选匹配项 → 校验回显)
+        selects = page.locator(".multiselect")
+        n_selects = await selects.count()
+        if n_selects < 2:
+            raise RuntimeError(
+                f"定时面板未找到时/分下拉(multiselect 数量 {n_selects} < 2)"
+            )
+        for idx, (value, label) in enumerate(
+            ((target.hour, "时"), (target.minute, "分"))
+        ):
+            ms = selects.nth(idx)
+            await ms.locator(".multiselect__select").first.click()
+            await asyncio.sleep(1)
+            option = page.locator(
+                "li.multiselect__element span.multiselect__option",
+                has_text=f"{value} {label}",
+            ).first
+            if not await option.count():
+                # 收起下拉,避免遮挡后续操作
+                await page.keyboard.press("Escape")
+                raise RuntimeError(f"定时发布「{label}」下拉中未找到选项: {value} {label}")
+            await option.click()
+            await asyncio.sleep(0.5)
+            shown = (
+                await ms.locator(".multiselect__single").first.text_content() or ""
+            ).strip()
+            if not shown.startswith(f"{value} "):
+                raise RuntimeError(
+                    f"定时发布「{label}」设置失败: 期望 {value} {label}, 回显 {shown!r}"
+                )
+
+        logger.info(
+            "[定时发布] 已设置定时发布时间: %s",
+            target.strftime("%Y-%m-%d %H:%M"),
+        )
+
 
     @staticmethod
     async def _click_publish(page):
