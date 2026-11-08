@@ -381,3 +381,208 @@ class JingmaiPlatform(BasePlatform):
 
         thread = threading.Thread(target=_launch, daemon=True)
         thread.start()
+
+    # ------------------------------------------------------------------
+    # list_works — 内容管理页作品列表(作品回链 + 统计同步数据源)
+    # ------------------------------------------------------------------
+
+    # 内容管理页(踩点 2026-11-02): hash 路由 SPA, 列表在 micro-iframe
+    # (dr.jd.com/n/content-list.html?platform=jm-pop)内。iframe 加载后
+    # 自动 POST api.m.jd.com/contentArticleList, 请求带京东 h5st 签名
+    # (无法自造签名直调, 故走"响应捕获"路线: 监听页面自己的请求解析
+    # 响应), 返回 result.contentList[], 条目含 id/title/publishTime/vid/
+    # contentStatus/pageView/likeCount/commentCount(未上线/审核驳回的
+    # 作品统计字段为 null)。
+    _CONTENT_LIST_URL = "https://dr.jd.com/jm/#/n/content-list.html?platform=jm-pop"
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list:
+        """抓取内容管理页作品列表(按发布时间倒序), 供回链与统计同步。
+
+        work_type 仅支持 'video'(京东内容管理页的内容类型=竖版视频);
+        其它类型返回 []。京东作品公开展示在 App 内, 列表条目无预览/
+        分享链接, url 置空串(契约允许, 统计仍可同步)。
+        任何异常(含 cookie 失效)只记日志并返回 [], 不抛出。
+        """
+        if work_type != "video":
+            return []
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+            try:
+                # 响应捕获: contentArticleList 是页面自己发的请求(带签名)
+                payloads = []
+
+                async def _on_response(response):
+                    try:
+                        if "contentArticleList" not in response.url:
+                            return
+                        if response.status != 200:
+                            return
+                        payloads.append(await response.json())
+                    except Exception:
+                        pass
+
+                page.on("response", _on_response)
+                try:
+                    await page.goto(
+                        self._CONTENT_LIST_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                except Exception:
+                    pass
+
+                # 轮询等接口响应; 期间 cookie 失效(跳登录域)提前退出
+                deadline = asyncio.get_event_loop().time() + 20
+                while not payloads and asyncio.get_event_loop().time() < deadline:
+                    if any(m in (page.url or "") for m in _COOKIE_INVALID_MARKERS):
+                        logger.info(
+                            f"[jingmai] 作品列表 cookie 失效(跳转 {page.url})"
+                        )
+                        return []
+                    await asyncio.sleep(0.5)
+
+                if payloads:
+                    works = self._parse_content_list(payloads, limit)
+                    logger.info(f"[jingmai] 作品列表抓到 {len(works)} 条(接口路线)")
+                    return works
+
+                # 兜底: 接口响应没等到 → 双 scope 轮询 DOM(主页面+全部
+                # frame 找列表表格行, 与 _scrape_stats 同模式)。DOM 无
+                # 统计数字, 只能拿到 作品ID/标题/发布时间/投稿状态。
+                logger.info("[jingmai] 作品列表接口未捕获, 降级 DOM 抓取")
+                return await self._scrape_content_rows(page, limit)
+            except Exception as e:
+                logger.info(f"[jingmai] list_works 失败: {e}")
+                return []
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.info(f"[jingmai] list_works 失败: {e}")
+            return []
+        finally:
+            await browser.close()
+
+    @staticmethod
+    def _parse_content_list(payloads, limit: int) -> list:
+        """把 contentArticleList 响应转成契约 dict 列表(按 id 去重)。"""
+        works = []
+        seen = set()
+        for payload in payloads:
+            for it in ((payload.get("result") or {}).get("contentList") or []):
+                wid = str(it.get("id") or "")
+                if not wid or wid in seen:
+                    continue
+                seen.add(wid)
+                works.append({
+                    "work_id": wid,
+                    "work_type": "video",
+                    "title": str(it.get("title") or "").strip(),
+                    "publish_time": str(it.get("publishTime") or ""),
+                    # 公开作品页在京东 App 内, 列表无预览/分享链接 → 置空串
+                    "url": "",
+                    "views": it.get("pageView"),
+                    "likes": it.get("likeCount"),
+                    "favorites": None,  # 接口无收藏字段
+                    "comments": it.get("commentCount"),
+                    "share": None,  # 接口无转发字段
+                    # 契约外排查字段
+                    "vid": str(it.get("vid") or ""),
+                    "content_status": it.get("contentStatus"),  # 实证 5=审核驳回
+                    "sub_position": str(it.get("subPositionName") or ""),
+                })
+                if len(works) >= limit:
+                    return works
+        return works
+
+    @staticmethod
+    async def _scrape_content_rows(page, limit: int) -> list:
+        """DOM 兜底: 双 scope(主页面+全部子 frame)轮询找列表表格行。
+
+        行结构(踩点实证): ``<tr data-row-key="{作品ID}">``, 单元格依次为
+        投稿内容(时长/标题/ID 行) / 投稿渠道 / 发布时间 / 投稿状态 / 操作。
+        """
+        selector = "tr[data-row-key]"
+
+        async def _find_scope(total_timeout: float):
+            """与 _scrape_stats 相同的主页面+全部子 frame 轮询。"""
+            deadline = asyncio.get_event_loop().time() + total_timeout
+            while asyncio.get_event_loop().time() < deadline:
+                # 1) 主页面(历史布局: 列表直接挂在首页 DOM)
+                try:
+                    await page.wait_for_selector(selector, timeout=1000)
+                    return page
+                except Exception:
+                    pass
+                # 2) 子 frame(现布局: 列表在 iframe.micro-iframe 内)
+                for frame in list(page.frames):
+                    if frame is page.main_frame:
+                        continue
+                    try:
+                        await frame.wait_for_selector(selector, timeout=500)
+                        return frame
+                    except Exception:
+                        # frame 可能正被 SPA 重建(detached), 下轮重枚举
+                        continue
+                await asyncio.sleep(0.5)
+            return None
+
+        scope = await _find_scope(12)
+        if scope is None:
+            logger.info("[jingmai] 作品列表 DOM 未出现(主页面+子frame均未命中)")
+            return []
+
+        try:
+            rows = await scope.evaluate(
+                """() => Array.from(document.querySelectorAll('tr[data-row-key]'))
+                    .map(tr => ({
+                        id: tr.getAttribute('data-row-key') || '',
+                        cells: Array.from(tr.querySelectorAll('td'))
+                            .map(td => (td.innerText || '').trim()),
+                    }))"""
+            )
+        except Exception as e:
+            logger.info(f"[jingmai] 作品列表 DOM evaluate 失败: {e}")
+            return []
+
+        works = []
+        for row in rows or []:
+            cells = row.get("cells") or []
+            # 单元格0 多行文本: 时长 / 标题 / ID: xxx(可能还有统计占位"-"),
+            # 标题 = 第一个既非时长(纯数字冒号)也非 ID 行的非空行
+            title = ""
+            for line in (cells[0] if cells else "").splitlines():
+                line = line.strip()
+                if not line or line.startswith("ID:"):
+                    continue
+                if line and all(ch.isdigit() or ch == ":" for ch in line):
+                    continue
+                title = line
+                break
+            works.append({
+                "work_id": str(row.get("id") or ""),
+                "work_type": "video",
+                "title": title,
+                "publish_time": cells[2].strip() if len(cells) > 2 else "",
+                "url": "",
+                "views": None,
+                "likes": None,
+                "favorites": None,
+                "comments": None,
+                "share": None,
+            })
+            if len(works) >= limit:
+                break
+        return works

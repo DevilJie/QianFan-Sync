@@ -2560,6 +2560,233 @@ class CsdnPlatform(BasePlatform):
         except Exception:
             return False
 
+    # ------------------------------------------------------------------
+    # list_works — 内容管理页作品列表(作品回链 + 统计同步数据源)
+    # ------------------------------------------------------------------
+
+    # 管理页(踩点 2026-11-02 实证):
+    #   文章 https://mp.csdn.net/mp_blog/manage/article (全部 tab=已发表,
+    #        草稿在「草稿箱」tab, status=all_v3 即不含草稿)
+    #   视频 https://mp.csdn.net/mp_others/manage/video
+    # 两个列表接口均走阿里 API 网关签名(x-ca-key/x-ca-nonce/x-ca-signature,
+    # 前端 JS 计算), 页内裸 fetch 直接 401 "X-Ca-Key is not exist", 无法像
+    # 抖音/大鱼号那样直调。改用响应捕获: 页面加载/点击分页时自己发签名
+    # 请求, 这里只监听 response 解析 JSON(不绕签名, 复用页面登录态)。
+    CSDN_ARTICLE_MANAGE_URL = "https://mp.csdn.net/mp_blog/manage/article"
+    CSDN_VIDEO_MANAGE_URL = "https://mp.csdn.net/mp_others/manage/video"
+    # 列表接口 URL 关键字 + 请求方法(踩点实证)
+    CSDN_ARTICLE_LIST_API = "blog/phoenix/console/v1/article/list"   # GET
+    CSDN_VIDEO_LIST_API = "resource-api/v1/video/videoList"          # POST
+    # 分页「下一页」按钮(mp_blog 侧是 el_mcm- 前缀的 Element 分支,
+    # mp_others 侧是标准 el-pagination; 元素不存在时跳过翻页)
+    CSDN_PAGER_NEXT_SEL = ".el_mcm-pagination .btn-next, .el-pagination .btn-next"
+
+    @staticmethod
+    def _csdn_stat_int(v):
+        """列表接口统计值转 int(文章接口的 viewCount/commentCount 是字符串)。
+
+        缺失/空/非法 → None(契约: 有则抓无则 None)。
+        """
+        if v is None or v == "":
+            return None
+        try:
+            return int(str(v).strip().replace(",", ""))
+        except (ValueError, TypeError):
+            return None
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list:
+        """抓取内容管理页作品列表(按发布时间倒序), 供回链与统计同步。
+
+        work_type 路由(踩点 2026-11-02):
+          'article' → mp_blog/manage/article, 接口返回 articleId/title/
+            postTime/viewCount/diggCount/collectCount/commentCount/username,
+            公开 URL 拼 blog.csdn.net/{username}/article/details/{articleId};
+          'video'   → mp_others/manage/video, 接口返回 id/title/updateTime/
+            playCount 等(平台不提供视频点赞/评论/收藏数, 置 None), 公开 URL
+            拼 live.csdn.net/v/{id}(实测可打开);
+          其它类型('image' 等) → 返回 []。
+        任何异常(含 cookie 失效)只记日志并返回 [], 不抛出。
+        """
+        if work_type == "image":
+            return []
+        if work_type not in ("video", "article"):
+            return []
+        if work_type == "article":
+            manage_url = self.CSDN_ARTICLE_MANAGE_URL
+            api_keyword = self.CSDN_ARTICLE_LIST_API
+            need_method = "GET"
+        else:
+            manage_url = self.CSDN_VIDEO_MANAGE_URL
+            api_keyword = self.CSDN_VIDEO_LIST_API
+            need_method = "POST"
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                captured = []  # 依次捕获的列表接口 data 段(翻页后按序追加)
+
+                def _on_response(resp):
+                    # 同步回调只做过滤, json() 解析交给协程
+                    # (与 _csdn_wait_save_response 同一模式)
+                    try:
+                        if api_keyword not in resp.url:
+                            return
+                        if resp.request.method != need_method:
+                            return
+                        asyncio.ensure_future(_absorb(resp))
+                    except Exception:
+                        pass
+
+                async def _absorb(resp):
+                    try:
+                        body = await resp.json()
+                    except Exception:
+                        return
+                    if isinstance(body, dict) and body.get("code") == 200:
+                        captured.append(body.get("data") or {})
+
+                page.on("response", _on_response)
+                try:
+                    await page.goto(
+                        manage_url, wait_until="domcontentloaded", timeout=30000
+                    )
+                except Exception:
+                    pass
+
+                # 等首屏列表接口响应(最多 15s)
+                deadline = time.time() + 15
+                while not captured and time.time() < deadline:
+                    await asyncio.sleep(0.5)
+
+                # cookie 失效: 页面跳 passport 登录页, 或列表接口始终无响应
+                if not captured:
+                    if "passport.csdn.net" in (page.url or ""):
+                        logger.info(
+                            "[CSDN作品列表] cookie 失效(跳转 %s)", page.url
+                        )
+                    else:
+                        logger.info(
+                            "[CSDN作品列表] 列表接口无响应(url=%s, work_type=%s)",
+                            page.url, work_type,
+                        )
+                    return []
+
+                # data 段 → {页码: 条目列表}(article: page/list, video: pageNo/data)
+                def _page_items(seg):
+                    if work_type == "article":
+                        return int(seg.get("page") or 1), list(seg.get("list") or [])
+                    return int(seg.get("pageNo") or 1), list(seg.get("data") or [])
+
+                pages = {}
+                for seg in captured:
+                    pno, items = _page_items(seg)
+                    pages.setdefault(pno, items)
+
+                # 翻页: 点「下一页」让页面自己再发签名请求(最多 5 轮凑满 limit)
+                try:
+                    for _ in range(5):
+                        if sum(len(v) for v in pages.values()) >= limit:
+                            break
+                        btn = page.locator(self.CSDN_PAGER_NEXT_SEL).first
+                        try:
+                            if await btn.count() == 0:
+                                break  # 只有 1 页时不渲染分页
+                            if not await btn.is_enabled():
+                                break  # 已到末页(按钮禁用)
+                            await btn.click(timeout=5000)
+                        except Exception:
+                            break
+                        before = len(captured)
+                        deadline = time.time() + 10
+                        while len(captured) == before and time.time() < deadline:
+                            await asyncio.sleep(0.5)
+                        for seg in captured[before:]:
+                            pno, items = _page_items(seg)
+                            pages.setdefault(pno, items)
+                except Exception as exc:
+                    logger.info("[CSDN作品列表] 翻页中断(保留已有页): %s", exc)
+
+                works = []
+                for pno in sorted(pages):
+                    for it in pages[pno]:
+                        if len(works) >= max(int(limit or 20), 1):
+                            break
+                        if work_type == "article":
+                            aid = str(it.get("articleId") or "")
+                            uname = str(it.get("username") or "")
+                            works.append({
+                                "work_id": aid,
+                                "work_type": "article",
+                                "title": str(it.get("title") or "").strip(),
+                                "publish_time": str(it.get("postTime") or ""),
+                                "url": (
+                                    f"https://blog.csdn.net/{uname}/article/details/{aid}"
+                                    if aid and uname else ""
+                                ),
+                                "views": self._csdn_stat_int(it.get("viewCount")),
+                                "likes": self._csdn_stat_int(it.get("diggCount")),
+                                "favorites": self._csdn_stat_int(it.get("collectCount")),
+                                "comments": self._csdn_stat_int(it.get("commentCount")),
+                                # 文章列表接口不提供转发数
+                                "share": None,
+                            })
+                        else:
+                            vid = str(it.get("id") or "")
+                            # 管理页展示的时间是 updateTime(视频处理完成时间),
+                            # 无则回退 time/createTime
+                            works.append({
+                                "work_id": vid,
+                                "work_type": "video",
+                                "title": str(it.get("title") or "").strip(),
+                                "publish_time": str(
+                                    it.get("updateTime")
+                                    or it.get("time")
+                                    or it.get("createTime")
+                                    or ""
+                                ),
+                                "url": f"https://live.csdn.net/v/{vid}" if vid else "",
+                                "views": self._csdn_stat_int(it.get("playCount")),
+                                # 视频管理页/接口不提供点赞/收藏/评论/转发数
+                                # (管理页 DOM .Visits 里这几项均为空)
+                                "likes": None,
+                                "favorites": None,
+                                "comments": None,
+                                "share": None,
+                            })
+                    if len(works) >= max(int(limit or 20), 1):
+                        break
+                logger.info(
+                    "[CSDN作品列表] work_type=%s 抓到 %d 条(共 %d 页/接口 %d 条)",
+                    work_type, len(works), len(pages),
+                    sum(len(v) for v in pages.values()),
+                )
+                return works
+            except Exception as exc:
+                logger.warning("[CSDN作品列表] list_works 失败: %s", exc)
+                return []
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("[CSDN作品列表] list_works 失败: %s", exc)
+            return []
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
 
 # ---------------------------------------------------------------------------
 # 素材方向查询已移除：CSDN 固定使用横版封面，不再需要按视频方向选择。

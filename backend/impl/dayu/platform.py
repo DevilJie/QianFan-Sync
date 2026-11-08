@@ -2631,6 +2631,126 @@ class DayuPlatform(BasePlatform):
             f"[文章][大鱼号] {action}失败 code={code} msg={msg}"
         )
 
+    # ------------------------------------------------------------------
+    # list_works — 内容管理页作品列表(作品回链 + 统计同步数据源)
+    # ------------------------------------------------------------------
+
+    # 内容管理页(/dashboard/contents)的 DOM 不含作品公开链接, 列表数据
+    # 全部来自该 JSON 接口(踩点 2026-11-02 实证)。页面上下文内 fetch
+    # 直调即可(_rid/_ 可自造, keyword 必须传空串, 传 '' 会过滤成空列表)。
+    _CONTENT_LIST_PATH = "/dashboard/getNewContentList"
+    # 公开作品页模板(踩点实测可打开, 无需 acl): 图文 article.html / 视频 video.html
+    _PUBLIC_ARTICLE_URL = "https://mparticle.uc.cn/article.html?wm_cid={cid}"
+    _PUBLIC_VIDEO_URL = "https://mparticle.uc.cn/video.html?wm_cid={cid}"
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list:
+        """抓取内容管理页作品列表(按发布时间倒序), 供回链与统计同步。
+
+        work_type 路由: 'article' 图文(format_type=1001) / 'video' 短视频
+        与小视频(format_type=1002) — contents 列表混排全部体裁, 按
+        format_type 区分; 'image' 图集不在此列表支持, 返回 []。
+        任何异常(含 cookie 失效)只记日志并返回 [], 不抛出。
+        """
+        if work_type not in ("video", "article"):
+            return []
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                try:
+                    await page.goto(
+                        CONTENTS_URL, wait_until="domcontentloaded", timeout=30000
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+                # cookie 失效: 被跳转出 dashboard(登录页) → 返回 []
+                if "/dashboard/" not in (page.url or ""):
+                    logger.info("[大鱼号作品列表] cookie 失效(跳转 %s)", page.url)
+                    return []
+
+                # 页内 fetch 直调列表接口(currentTab=all 混排全部体裁),
+                # 每页 10 条, 最多翻 5 页凑满 limit
+                raw = await page.evaluate(
+                    """async (args) => {
+                        const [path, limit] = args;
+                        const wantPages = Math.min(5, Math.ceil(limit / 10) || 1);
+                        const items = [];
+                        for (let pageNo = 1; pageNo <= wantPages; pageNo++) {
+                            const rid = Math.random().toString(16).slice(2)
+                                .padEnd(32, '0');
+                            const qs = `?_rid=${rid}&keyword=&currentView=all`
+                                + `&source=all&page=${pageNo}&currentTab=all`
+                                + `&_=${Date.now()}`;
+                            const resp = await fetch(`${path}${qs}`, {
+                                credentials: 'include',
+                            });
+                            if (!resp.ok) return {error: `http ${resp.status}`};
+                            const data = await resp.json();
+                            const list = (data.dataList && data.dataList.data) || [];
+                            items.push(...list);
+                            const totalPage = data.dataList
+                                && data.dataList.totalPage;
+                            if (!list.length || (totalPage && pageNo >= totalPage)) {
+                                break;
+                            }
+                        }
+                        return {items};
+                    }""",
+                    [self._CONTENT_LIST_PATH, max(int(limit or 20), 1)],
+                )
+                if not isinstance(raw, dict) or raw.get("error"):
+                    logger.info("[大鱼号作品列表] 接口返回异常: %s", raw)
+                    return []
+
+                # format_type: 1001=图文(article), 1002=短视频/小视频(video)
+                want_ft = 1002 if work_type == "video" else 1001
+                url_template = (
+                    self._PUBLIC_VIDEO_URL if work_type == "video"
+                    else self._PUBLIC_ARTICLE_URL
+                )
+                works = []
+                for it in raw.get("items") or []:
+                    if it.get("format_type") != want_ft:
+                        continue
+                    cid = str(it.get("content_id") or it.get("_id") or "")
+                    rd = it.get("realData") or {}
+                    # 播放/阅读: 视频行在 video_vv, 图文行在 click_pv
+                    views = max(
+                        int(rd.get("video_vv") or 0), int(rd.get("click_pv") or 0)
+                    )
+                    works.append({
+                        "work_id": cid,
+                        "work_type": work_type,
+                        "title": str(it.get("title") or "").strip(),
+                        "publish_time": str(it.get("publish_at") or ""),
+                        "url": url_template.format(cid=cid) if cid else "",
+                        "views": views,
+                        "likes": rd.get("like_pv"),
+                        "favorites": rd.get("fav_pv"),
+                        "comments": rd.get("comment_pv"),
+                        "share": rd.get("share_pv"),
+                    })
+                    if len(works) >= limit:
+                        break
+                logger.info(
+                    "[大鱼号作品列表] work_type=%s 过滤后 %d 条(接口共 %d 条)",
+                    work_type, len(works), len(raw.get("items") or []),
+                )
+                return works
+            finally:
+                await context.close()
+        except Exception as exc:
+            logger.warning("[大鱼号作品列表] list_works 失败: %s", exc)
+            return []
+        finally:
+            await self.close_browser(browser, is_close_by_code=True)
+
 
 def _parse_switch(switch_text: str):
     """把 datetimepicker 的「九月 2026」文本解析为 (year, month)。"""

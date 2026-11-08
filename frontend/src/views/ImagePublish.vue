@@ -708,6 +708,10 @@ function onMaterialSelected(material) {
 
 // ========== Publish Methods ==========
 
+// 各平台图集数量上限(超出自动丢弃超出部分)。快手 31 张为发布页文案实证
+// (「支持最多31张,最大15MB的图片文件」);未列出的平台沿用系统 35 张上限
+const PLATFORM_IMAGE_LIMITS = { kuaishou: 31 }
+
 async function saveDraft() {
   try {
     const allPlatformConfigs = {}
@@ -827,7 +831,7 @@ async function publishAll() {
     for (const account of group.accounts) {
       if (!publishAccountIds.has(account.id)) continue
       const merged = resolveAccountConfig(group.key, account.id)
-      allTasks.push({ account, groupKey: group.key, merged })
+      allTasks.push({ account, groupKey: group.key, groupName: group.name, merged })
     }
   }
 
@@ -843,13 +847,20 @@ async function publishAll() {
       publishResults.value.push({ label: allTasks[i].account.name, status: 'cancelled', message: '已取消' })
       continue
     }
-    const { account, groupKey, merged } = allTasks[i]
+    const { account, groupKey, groupName, merged } = allTasks[i]
     currentPublishingAccount.value = account.name
     publishProgress.value = Math.floor((i / allTasks.length) * 100)
 
     // merged 出的 images / coverImage 走 commonData（panel 默认使用 commonData）
     // title/description/tags/platformConfig（aiContent/isOriginal 等）走 panel 自身 merged（panel.getMergedConfig）
-    const commonData = { images: merged.images, coverImage: merged.coverImage }
+    // 平台图集数量上限:超限自动丢弃超出部分(只保留前 N 张)并提示,不阻断发布
+    let images = merged.images || []
+    const imgLimit = PLATFORM_IMAGE_LIMITS[groupKey]
+    if (imgLimit && images.length > imgLimit) {
+      images = images.slice(0, imgLimit)
+      ElMessage.warning(`「${groupName}」图集最多支持 ${imgLimit} 张图片，已自动丢弃超出部分（保留前 ${imgLimit} 张）`)
+    }
+    const commonData = { images, coverImage: merged.coverImage }
 
     const panel = getPanel(groupKey)
     if (panel) {
@@ -1234,10 +1245,14 @@ onMounted(async () => {
     justify-content: flex-end;
 
     .header-btn {
-      // el-button 默认 padding 8px 15px / font-size 14px / height 32px
-      // 想要更紧凑一点,小分辨率下自动缩
+      // 与主按钮统一高度(40px),消除「普通按钮矮一截」的参差感
+      height: 40px;
+      padding: 0 18px;
+      border-radius: 8px;
+      font-weight: 500;
       @media (max-width: 1280px) {
-        padding: 6px 12px !important;
+        height: 36px;
+        padding: 0 12px !important;
         font-size: 12px !important;
       }
     }
@@ -1248,7 +1263,7 @@ onMounted(async () => {
       border: 1px dashed rgba($overlay-rgb, 0.28);
       box-shadow: none;
       color: $text-secondary;
-      padding: 8px 14px !important;
+      padding: 0 14px !important;
 
       &:hover {
         background: rgba($brand-start, 0.08);
@@ -1264,7 +1279,7 @@ onMounted(async () => {
       box-shadow: 0 4px 20px rgba($brand-start, 0.35) !important;
       font-weight: 700;
       letter-spacing: 0.04em;
-      padding: 10px 24px !important;
+      padding: 0 24px !important;
 
       &:hover {
         box-shadow: 0 6px 28px rgba($brand-start, 0.5) !important;

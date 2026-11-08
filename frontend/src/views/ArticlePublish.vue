@@ -169,6 +169,8 @@
                 ref="baijiahaoPanelRef"
                 :account-id="selectedPlatform === 'baijiahao' ? selectedAccountId : null"
                 :disabled="publishing"
+                :shared-cover="publishCoverStoredPath || ''"
+                :body-image-count="imageCount"
                 v-show="selectedPlatform === 'baijiahao'"
                 @config-changed="onChannelConfigChanged"
                 @publish-result="onPublishResult"
@@ -986,7 +988,8 @@ startAutoSaveTimer()
     border: 1px dashed rgba($overlay-rgb, 0.28);
     box-shadow: none;
     color: $text-secondary;
-    padding: 8px 14px !important;
+    padding: 0 14px !important;
+    height: 40px;
 
     &:hover {
       background: rgba($brand-start, 0.08);
@@ -995,11 +998,42 @@ startAutoSaveTimer()
     }
   }
 
+  // 头部按钮统一高度(40px,与主按钮一致),消除参差感
+  .header-btn {
+    height: 40px;
+    padding: 0 18px;
+    border-radius: 8px;
+    font-weight: 500;
+    @media (max-width: 1280px) {
+      height: 36px;
+      padding: 0 12px !important;
+      font-size: 12px !important;
+    }
+  }
+
+  // 主按钮:项目渐变 + 阴影(对齐 ImagePublish/PublishCenter 的头部主按钮)
+  .header-btn--primary {
+    background: linear-gradient(135deg, #8b5cf6, #6366f1) !important;
+    border: none !important;
+    box-shadow: 0 4px 20px rgba($brand-start, 0.35) !important;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 0 24px !important;
+
+    &:hover {
+      box-shadow: 0 6px 28px rgba($brand-start, 0.5) !important;
+      transform: translateY(-1px);
+      opacity: 1 !important;
+    }
+    &:active { transform: translateY(0) scale(0.98); }
+    &:disabled { opacity: 0.5 !important; cursor: not-allowed; transform: none; box-shadow: none !important; }
+  }
+
   .publish-mode-radio {
     margin-right: 4px;
 
     :deep(.el-radio-button__inner) {
-      padding: 5px 12px;
+      padding: 8px 14px;
     }
   }
 

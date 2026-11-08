@@ -26,6 +26,15 @@ logger = get_channel_logger("tencent_video")
 _LOGIN_URL = "https://mp.v.qq.com/"
 _HOME_URL = "https://mp.v.qq.com/homepage"
 _PUBLISH_URL = "https://mp.v.qq.com/publishVideo/video"
+# 内容管理页(导航「内容管理/视频管理」指向 /manage/0, 2026-11 踩点实证)
+_MANAGE_URL = "https://mp.v.qq.com/manage/0"
+# 作品列表/单作品统计接口(均为 GET, 需会话令牌 g_vstk, 从页面自身请求中提取)
+_USER_VIDEO_LIST_API = (
+    "https://access.v.qq.com/trpc.creator_center.backend.VideoFusion/GetUserVideoList"
+)
+_VIDEO_INFO_API = (
+    "https://access.v.qq.com/trpc.creator_center.data_center.data_center/GetVideoInfo"
+)
 
 # ---------------------------------------------------------------------------
 # Creation declaration options (matches the platform checkboxes)
@@ -587,6 +596,19 @@ class TencentVideoPlatform(BasePlatform):
                         "可能上传失败或网络异常, 继续后续步骤"
                     )
 
+                # Pre-form screenshot（表单渲染就绪后, 仿 bilibili, 供 E2E 报告佐证）
+                try:
+                    log_dir = Path(BASE_DIR / "logs")
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    await page.screenshot(
+                        path=str(log_dir / "tencent_video_before_form.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] before_form 截图失败(不影响发布): %s", e
+                    )
+
                 # Step 3: Fill title
                 await self._fill_title(page, title or desc)
 
@@ -961,6 +983,19 @@ class TencentVideoPlatform(BasePlatform):
                 timeout=30_000,
             )
 
+        # Pre-submit screenshot（全部字段填写完成、点击发布按钮之前, full_page 测试报告核心佐证）
+        try:
+            log_dir = Path(BASE_DIR / "logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(
+                path=str(log_dir / "tencent_video_before_submit.png"),
+                full_page=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "[发布] before_submit 截图失败(不影响发布): %s", e
+            )
+
         await publish_btn.click()
         logger.info("[发布] Publish button clicked, waiting for publish result")
 
@@ -1010,3 +1045,188 @@ class TencentVideoPlatform(BasePlatform):
             raise Exception("发布失败：未检测到发布成功信号（页面未跳转，无成功文本）")
 
         await asyncio.sleep(2)
+
+        # After-submit screenshot（成功判定完成后、流程收尾前, 仿 bilibili settled 2s 后截图）
+        try:
+            log_dir = Path(BASE_DIR / "logs")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(
+                path=str(log_dir / "tencent_video_after_submit.png"),
+                full_page=True,
+            )
+        except Exception as e:
+            logger.warning(
+                "[发布] after_submit 截图失败(不影响发布): %s", e
+            )
+
+    # ------------------------------------------------------------------
+    # list_works — 内容管理页作品列表(作品回链 + 统计同步数据源)
+    # ------------------------------------------------------------------
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取内容管理页(mp.v.qq.com/manage/0)的视频作品列表（按发布时间倒序）。
+
+        实现（2026-11 踩点）：内容管理页加载后页面自己会请求
+        ``trpc.creator_center.backend.VideoFusion/GetUserVideoList``，但该接口
+        必须携带会话令牌 ``g_vstk``（运行时生成，cookie/HTML 里都没有，错值
+        返回 "unknow error"）。因此仿 B站做法分两步：
+          1. page.on("request") 监听页面自身请求，从 URL 提取 g_vstk；
+          2. 页内 fetch 直调同一接口（credentials 带登录态），page_size 可控，
+             并逐 vid 调 GetVideoInfo 补真实累计播放量（管理页行内 allnumc 是
+             非 T+0 口径，实测 1 vs 真实 2，不可作为播放量）。
+        未捕获该请求 = 未登录/cookie 失效 → return []。
+
+        work_type 仅支持 'video'（腾讯视频创作平台只有视频）；其它类型 → []。
+        异常一律 log + return []，不影响调用方。
+        """
+        if work_type != "video":
+            return []
+
+        def _to_int(v):
+            # 接口数值字段均为字符串('2'/'0')，空/非法 → None(契约: 没有则 null)
+            try:
+                if v is None or str(v).strip() == "":
+                    return None
+                return int(str(v).strip())
+            except (ValueError, TypeError):
+                return None
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+
+                # 1. 监听页面自己的列表请求，提取会话令牌 g_vstk
+                #    (本平台已有 page.on("request") 监听 trpc 的先例, 见 _upload_one_video)
+                list_req_url = None
+                got_list_req = asyncio.Event()
+
+                def _on_list_request(request):
+                    nonlocal list_req_url
+                    if "GetUserVideoList" in request.url and not got_list_req.is_set():
+                        list_req_url = request.url
+                        got_list_req.set()
+
+                page.on("request", _on_list_request)
+
+                await page.goto(_MANAGE_URL, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                # 未登录时页面不调该接口 → 以此作为跳登录判定
+                try:
+                    await asyncio.wait_for(got_list_req.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "[腾讯视频作品列表] 未捕获 GetUserVideoList 请求(未登录/cookie 失效), url=%s",
+                        page.url,
+                    )
+                    return []
+
+                g_vstk = list_req_url.split("g_vstk=")[-1].split("&")[0]
+
+                # 2. 页内 fetch 直调列表接口(复用 g_vstk, page_size 可控)，仿 B站做法
+                page_size = max(1, min(int(limit or 20), 50))
+                items = await page.evaluate(
+                    """async ([api, g_vstk, pageSize, maxItems]) => {
+                        const items = [];
+                        // 翻页直到取满 maxItems；接口返回 page_total 控制循环上限
+                        for (let p = 1; p <= 10 && items.length < maxItems; p++) {
+                            const url = `${api}?g_vstk=${g_vstk}&refer=vcc_web`
+                                + `&sort_type=0&sort_flag=1&page=${p}&page_size=${pageSize}`
+                                + `&list_type=0&origin=1`;
+                            const j = await (await fetch(url, {credentials: 'include'})).json();
+                            if (!j || String(j.code) !== '0'
+                                || !j.data || !Array.isArray(j.data.list)) break;
+                            items.push(...j.data.list);
+                            const pg = j.data.pagination || {};
+                            if (Number(pg.page_total || 1) <= p) break;
+                        }
+                        return items.slice(0, maxItems);
+                    }""",
+                    [_USER_VIDEO_LIST_API, g_vstk, page_size, page_size],
+                )
+                if not items:
+                    logger.info("[腾讯视频作品列表] 接口未返回作品(g_vstk=%s)", g_vstk)
+                    return []
+
+                # 3. 逐 vid 调 GetVideoInfo 补真实累计统计(播放/点赞/评论/分享)
+                vids = [it.get("vid") for it in items if it.get("vid")]
+                infos = await page.evaluate(
+                    """async ([api, g_vstk, vids]) => {
+                        const out = {};
+                        for (const vid of vids) {
+                            try {
+                                const url = `${api}?g_vstk=${g_vstk}&refer=vcc_web&vid=${vid}&origin=1`;
+                                const j = await (await fetch(url, {credentials: 'include'})).json();
+                                const it = j && j.data && j.data.infos ? j.data.infos[vid] : null;
+                                if (it) out[vid] = it;
+                            } catch (e) { /* 单个失败不影响整体 */ }
+                        }
+                        return out;
+                    }""",
+                    [_VIDEO_INFO_API, g_vstk, vids],
+                )
+
+                # 4. 组装契约字段
+                from datetime import datetime  # noqa: PLC0415
+
+                works = []
+                for it in items:
+                    vid = it.get("vid") or ""
+                    info = infos.get(vid) or {}
+                    # 发布时间: 优先列表页展示口径 upload_time, 缺失退回数据中心的精确时间
+                    publish_time = (it.get("upload_time") or info.get("publish_time") or "").strip()
+                    try:
+                        # 校验文本合法(契约要求原样保存, 仅剔除异常值)
+                        datetime.strptime(publish_time[:16], "%Y-%m-%d %H:%M")
+                    except (ValueError, TypeError):
+                        publish_time = publish_time or ""
+                    status_show = it.get("status_show") or {}
+                    status = ""
+                    if isinstance(status_show, dict):
+                        first = next(iter(status_show.values()), None)
+                        if isinstance(first, dict):
+                            status = (first.get("title") or "").strip()
+                    works.append({
+                        "work_id": vid,
+                        "work_type": "video",
+                        "title": (it.get("title") or "").strip(),
+                        "publish_time": publish_time,
+                        # 公开作品页(踩点实证: 管理页标题/封面链接即此格式)
+                        "url": f"https://v.qq.com/x/page/{vid}.html" if vid else "",
+                        # 播放量取数据中心的累计 play_cnt(与首页「播放量」一致);
+                        # 行内 allnumc 口径存疑(T+1), 不采用 → 接口失败时为 None
+                        "views": _to_int(info.get("play_cnt")),
+                        # 点赞/评论: 数据中心优先, 行内字段兜底(口径一致)
+                        "likes": _to_int(info.get("like_cnt") if info else it.get("like")),
+                        "favorites": None,  # 腾讯视频无收藏指标
+                        "comments": _to_int(info.get("comment_cnt") if info else it.get("comment")),
+                        "share": _to_int(info.get("in_call_share_page_cnt")),
+                        # 契约外附带字段: 审核状态(审核通过/审核未通过/转码失败等), 排查用
+                        "status": status,
+                    })
+
+                logger.info(
+                    "[腾讯视频作品列表] 抓到 %d 条作品 (g_vstk=%s, 补充统计 %d 条)",
+                    len(works), g_vstk, len(infos),
+                )
+                return works
+            except Exception as e:
+                logger.info(f"[腾讯视频作品列表] 抓取失败: {e}")
+                return []
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.info(f"[腾讯视频作品列表] list_works 失败: {e}")
+            return []
+        finally:
+            await browser.close()

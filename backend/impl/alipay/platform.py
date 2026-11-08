@@ -506,6 +506,9 @@ class AlipayPlatform(BasePlatform):
         music_title: str = "",
     ):
         """一组图片上传到单个账号的完整流程。"""
+        log_dir = Path(BASE_DIR / "logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+
         logger.info("[上传图集] 开始上传图集 (%d 张图片)", len(file_paths))
         logger.info("[上传图集] 标题: %s", title)
         browser = await self.create_browser(headless=False)
@@ -531,6 +534,18 @@ class AlipayPlatform(BasePlatform):
                 # 2. 等待表单可交互(标题输入框可见)
                 await self._wait_for_image_form(page)
 
+                # 表单渲染截图(发布佐证,失败不影响发布;
+                # 表单内容可能在 iframe 内,用 page 级全页截图即可拍到)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "alipay_image_before_form.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传图集] 表单截图失败(不影响发布): %s", e
+                    )
+
                 # 3. 填标题
                 await self._set_title(page, title)
 
@@ -544,11 +559,33 @@ class AlipayPlatform(BasePlatform):
                 # 6. 作者声明(必填,默认「内容由AI生成」)
                 await self._set_author_statement(page, author_statement)
 
+                # 提交前截图(全部字段填写完成,发布佐证)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "alipay_image_before_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传图集] 提交前截图失败(不影响发布): %s", e
+                    )
+
                 # 7. 点击「确认发布」
                 await self._click_publish(page)
 
                 # 8. 等待发布成功(图集走 short-content 跳转判据)
                 await self._wait_for_publish_success(page, page_type="image")
+
+                # 提交后截图(发布佐证,失败不影响发布)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "alipay_image_after_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传图集] 提交后截图失败(不影响发布): %s", e
+                    )
 
                 # 9. 保存 cookie
                 await context.storage_state(path=account_file)
@@ -911,6 +948,9 @@ class AlipayPlatform(BasePlatform):
         reprint_url: str = "",
     ):
         """单个视频上传到单个账号的完整流程。"""
+        log_dir = Path(BASE_DIR / "logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+
         # 打印完整上送参数,便于排查(与其他渠道日志风格一致)
         logger.info(
             "[上传视频] ===== 上送参数 =====\n"
@@ -963,6 +1003,18 @@ class AlipayPlatform(BasePlatform):
                 # 2. 等待上传完成 + 表单渲染
                 await self._wait_for_upload_form(page)
 
+                # 表单渲染截图(发布佐证,失败不影响发布;
+                # 表单内容可能在 iframe 内,用 page 级全页截图即可拍到)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "alipay_before_form.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] 表单截图失败(不影响发布): %s", e
+                    )
+
                 # 3. 填标题
                 await self._set_title(page, title)
 
@@ -991,11 +1043,33 @@ class AlipayPlatform(BasePlatform):
                 if enable_timer and schedule_time_str:
                     await self._set_schedule_time(page, schedule_time_str)
 
+                # 提交前截图(全部字段填写完成,发布佐证)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "alipay_before_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] 提交前截图失败(不影响发布): %s", e
+                    )
+
                 # 9. 点击"确认发布"
                 await self._click_publish(page)
 
                 # 10. 等待发布成功
                 await self._wait_for_publish_success(page)
+
+                # 提交后截图(发布佐证,失败不影响发布)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "alipay_after_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] 提交后截图失败(不影响发布): %s", e
+                    )
 
                 # 11. 保存 cookie
                 await context.storage_state(path=account_file)

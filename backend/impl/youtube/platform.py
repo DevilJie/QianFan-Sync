@@ -92,26 +92,31 @@ class YoutubePlatform(BasePlatform):
             page = context.pages[0] if context.pages else await context.new_page()
 
             logger.info(_msg("navigating to accounts.google.com"))
-            await page.goto("https://accounts.google.com/", timeout=30000)
-            logger.info(_msg(f"page loaded, title: {await page.title()}"))
-
-            # Poll URL until it leaves accounts.google.com
             try:
-                while True:
-                    current_url = page.url
-                    if (
-                        "accounts.google.com" in current_url
-                        and (
-                            "signin" in current_url
-                            or current_url.endswith("accounts.google.com/")
-                        )
-                    ):
-                        await asyncio.sleep(1)
-                        continue
-                    logger.info(_msg(f"login detected, current page: {current_url}"))
-                    break
-            except Exception:
-                logger.info(_msg("login poll exception (ignored)"))
+                await page.goto("https://accounts.google.com/", timeout=30000)
+                logger.info(_msg(f"page loaded, title: {await page.title()}"))
+            except Exception as e:
+                # 打开失败（代理/网络慢导致超时）不中止登录：
+                # 浏览器保持打开，用户可手动在地址栏进入登录页
+                logger.info(_msg(f"goto accounts.google.com failed (browser kept open): {e}"))
+
+            # 等待登录完成（不设超时——Google 登录可能耗时几分钟）：
+            #   - 页面停留在 accounts.google.com 域内 → 继续等；
+            #   - URL 离开该域 → 登录流程走完，进入验证阶段；
+            #   - 用户手动关闭浏览器 → 取消登录（app.py 统一上报「用户关闭了浏览器」）。
+            # 注意判定条件是「域名」而非 URL 含 'signin'：Google 的 AccountChooser /
+            # ServiceLogin / speedbump / consent 等中间页均不带 signin，
+            # 旧逻辑会把它们误判成「登录完成」而提前关闭浏览器。
+            while True:
+                if page.is_closed() or not context.pages:
+                    logger.info(_msg("browser closed by user, login cancelled"))
+                    raise asyncio.CancelledError("用户关闭了浏览器")
+                current_url = page.url
+                if "accounts.google.com" in current_url:
+                    await asyncio.sleep(1)
+                    continue
+                logger.info(_msg(f"login detected, current page: {current_url}"))
+                break
 
             # Verify by navigating to YouTube Studio
             try:

@@ -115,12 +115,16 @@ def publish_images():
 
     try:
         conn = _get_db()
+        # source 必须非空:历史列表默认过滤 source 为空且无新版封面字段的
+        # 批次(视为 v0.6.0 旧数据),图集明细不含 coverLandscape/videoLandscape,
+        # 不写 source 会被历史列表整体过滤掉(v0.6.0 时代的老 bug,图集记录
+        # 一直不可见)
         conn.execute(
             """INSERT OR IGNORE INTO publish_batches
                (id, type, title, description, image_material_ids,
                 landscape_cover_material_id, portrait_cover_material_id,
-                account_count, status, created_at, updated_at)
-               VALUES (?, 'image', ?, ?, ?, ?, ?, 0, 'pending', ?, ?)""",
+                account_count, status, created_at, updated_at, source)
+               VALUES (?, 'image', ?, ?, ?, ?, ?, 0, 'pending', ?, ?, 'image_publish')""",
             (batch_id, title, description, json.dumps(image_ids, ensure_ascii=False),
              data.get('landscapeCoverMaterialId', ''),
              data.get('portraitCoverMaterialId', ''),
@@ -485,12 +489,16 @@ def execute_publish():
 
     try:
         conn = _get_db()
+        # source 必须非空:历史列表默认过滤 source 为空且无新版封面字段的
+        # 批次(视为 v0.6.0 旧数据),图集明细不含 coverLandscape/videoLandscape,
+        # 不写 source 会被历史列表整体过滤掉(v0.6.0 时代的老 bug,图集记录
+        # 一直不可见)
         conn.execute(
             """INSERT OR IGNORE INTO publish_batches
                (id, type, title, description, image_material_ids,
                 landscape_cover_material_id, portrait_cover_material_id,
-                account_count, status, created_at, updated_at)
-               VALUES (?, 'image', ?, ?, ?, ?, ?, 0, 'pending', ?, ?)""",
+                account_count, status, created_at, updated_at, source)
+               VALUES (?, 'image', ?, ?, ?, ?, ?, 0, 'pending', ?, ?, 'image_publish')""",
             (batch_id, title, description, json.dumps(image_ids, ensure_ascii=False),
              data.get('landscapeCoverMaterialId', ''),
              data.get('portraitCoverMaterialId', ''),

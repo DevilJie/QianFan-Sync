@@ -504,6 +504,9 @@ class BaijiahaoPlatform(BasePlatform):
         ai_content=False,
     ):
         """Upload a single video to one Baijiahao account."""
+        log_dir = Path(BASE_DIR / "logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+
         browser = await self.create_browser(headless=False)
         try:
             context = await self.create_context(
@@ -529,6 +532,9 @@ class BaijiahaoPlatform(BasePlatform):
                     timeout=60000,
                 )
                 logger.info("[上传视频] 发布页面已打开")
+                # 关闭平台广告弹窗(视频编辑页也可能弹「AI创作搭子」等
+                # 推广浮层, 遮罩会拦截上传/表单交互)
+                await self._dismiss_platform_modals(page)
 
                 # 注册上传完成请求监听器（必须在 set_input_files 之前注册，
                 # 否则可能错过在表单填充期间触发的完成请求）
@@ -567,6 +573,20 @@ class BaijiahaoPlatform(BasePlatform):
 
                 # Fill title and tags
                 await asyncio.sleep(1)
+                # 上传等待期间可能再弹广告浮层, 表单交互前再清一次
+                await self._dismiss_platform_modals(page)
+
+                # 表单渲染截图(发布佐证,失败不影响发布)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "baijiahao_before_form.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] 表单截图失败(不影响发布): %s", e
+                    )
+
                 logger.info("[填写标题] 开始填写标题与话题...")
                 await self._add_title_tags(page, title, desc, tags)
                 logger.info("[填写标题] 标题: %s", title)
@@ -627,6 +647,17 @@ class BaijiahaoPlatform(BasePlatform):
                 )
                 logger.info("[设置声明] 创作声明设置完成")
 
+                # 提交前截图(全部字段填写完成,发布佐证)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "baijiahao_before_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] 提交前截图失败(不影响发布): %s", e
+                    )
+
                 # Publish (immediate or scheduled)
                 logger.info("[发布] 正在点击发布按钮...")
                 await self._publish_video(page, publish_date)
@@ -665,6 +696,17 @@ class BaijiahaoPlatform(BasePlatform):
                     )
                     raise Exception(
                         f"视频发布后未成功跳转, 当前URL: {current_url}"
+                    )
+
+                # 提交后截图(发布佐证,失败不影响发布)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "baijiahao_after_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] 提交后截图失败(不影响发布): %s", e
                     )
 
                 # Save updated cookie state
@@ -755,6 +797,10 @@ class BaijiahaoPlatform(BasePlatform):
         than a separate title input. Tags are typed as #话题 via keyboard
         to trigger the topic search dropdown, then the first suggestion is
         selected.
+
+        填完描述后尽力而为填独立标题输入框(见 _try_fill_video_title):
+        不同版本 videoV2 页面有的带标题输入框、有的只有描述, 检测不到就
+        维持现状(描述文本即平台作品标题)。
         """
         # 描述为空时不再回落标题，保持为空
         desc_text = (desc or "").strip()[:2000]
@@ -773,6 +819,7 @@ class BaijiahaoPlatform(BasePlatform):
                     full_text += " " + " ".join(f"#{t}" for t in tags)
                 await title_container.fill(full_text[:2000])
                 logger.info("[填写简介] 已通过 placeholder 填充描述: %s", full_text[:2000])
+                await BaijiahaoPlatform._try_fill_video_title(page, title, desc_text)
                 return
             logger.warning("[填写标题] 未找到描述输入框，跳过填充")
             return
@@ -799,6 +846,70 @@ class BaijiahaoPlatform(BasePlatform):
                 await asyncio.sleep(0.5)
             except Exception:
                 logger.info("[填写标题] 话题 #%s 未出现下拉建议，跳过选择", tag)
+
+        # 3. 尽力而为: 描述填完后若页面存在独立标题输入框则补填标题
+        await BaijiahaoPlatform._try_fill_video_title(page, title, desc_text)
+
+    @staticmethod
+    async def _try_fill_video_title(page, title, desc_text: str):
+        """尽力而为: 检测视频编辑页是否有独立标题输入框, 有且为空则填 title。
+
+        背景(2026-11-02 E2E): videoV2 页面实现上无独立标题输入框时, 平台
+        作品标题 = 描述文本 + #话题; 不同页面版本可能带「添加标题获得更多
+        推荐」类占位的标题输入框 —— 检测到可见且为空的才填(title 与描述
+        相同则跳过, 避免标题描述重复占 50 字上限); 检测不到维持现状并打
+        info 日志说明。纯检测+填充, 任何异常吞掉, 不影响发布主流程。
+        """
+        t = (title or "").strip()[:50]
+        if not t or t == (desc_text or "").strip():
+            return
+        try:
+            state = await page.evaluate(
+                """(titleText) => {
+                  const vis = (el) => {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 0 && r.height > 0;
+                  };
+                  const el = [...document.querySelectorAll(
+                      'input, textarea, [contenteditable="true"]')]
+                    .filter(vis)
+                    .find((el) => {
+                      const ph = el.getAttribute('placeholder') || '';
+                      return ph.includes('标题');
+                    });
+                  if (!el) return 'notfound';
+                  const cur = el.isContentEditable
+                    ? (el.innerText || '')
+                    : (el.value || '');
+                  if ((cur || '').trim()) return 'filled';
+                  if (el.isContentEditable) {
+                    el.focus();
+                    document.execCommand('insertText', false, titleText);
+                  } else {
+                    // React 受控输入需用原生 setter 触发 onChange
+                    const proto = el.tagName === 'TEXTAREA'
+                      ? window.HTMLTextAreaElement.prototype
+                      : window.HTMLInputElement.prototype;
+                    Object.getOwnPropertyDescriptor(proto, 'value')
+                      .set.call(el, titleText);
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                  }
+                  return 'ok';
+                }""",
+                t,
+            )
+            state = str(state)
+            if state == "ok":
+                logger.info("[填写标题] 已填入视频标题输入框: %s", t)
+            elif state == "notfound":
+                logger.info(
+                    "[填写标题] 未找到视频标题输入框，标题未单独填写"
+                    "（平台作品标题取描述内容）"
+                )
+            else:  # filled: 该框已有内容(如占位兜底路径填了描述), 不覆盖
+                logger.info("[填写标题] 标题输入框已有内容, 跳过填写")
+        except Exception as exc:
+            logger.info("[填写标题] 标题输入框检测/填充失败(忽略): %s", exc)
 
     # ------------------------------------------------------------------
     # Helper: publish (immediate or scheduled)
@@ -1253,6 +1364,9 @@ class BaijiahaoPlatform(BasePlatform):
             sanitize_article_html,
         )
 
+        log_dir = Path(BASE_DIR / "logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+
         logger.info("[文章][百家号] 开始图文发布")
         logger.info("[文章][百家号] 标题: %s", title)
         logger.info("[文章][百家号] 正文 HTML 长度: %d", len(html))
@@ -1291,6 +1405,20 @@ class BaijiahaoPlatform(BasePlatform):
                     self._ARTICLE_EDITOR_URL, timeout=60000
                 )
                 await self._wait_article_editor_ready(page)
+
+                # 编辑器表单截图(发布佐证,失败不影响发布;
+                # 正文在 iframe 内,用 page 级全页截图即可拍到)
+                try:
+                    await page.screenshot(
+                        path=str(
+                            log_dir / "baijiahao_article_before_form.png"
+                        ),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[文章][百家号] 表单截图失败(不影响发布): %s", e
+                    )
 
                 # 1. 标题
                 await self._fill_article_title(page, title)
@@ -1333,13 +1461,21 @@ class BaijiahaoPlatform(BasePlatform):
                 logger.info("[文章][百家号] 正文已注入")
 
                 # 4. 封面(显式封面/三图/正文首图)
-                await self._set_article_cover(
+                cover_ok = await self._set_article_cover(
                     page,
                     cover_path=cover_path,
                     cover_mode=cover_mode,
                     extra_cover_paths=extra_cover_paths,
                     body_images=body_local_paths,
                 )
+                # 百家号文章封面必填: 封面未设置且正文无图(兜底不可用)时
+                # 快速失败 —— 继续提交会被平台前端拦截, 发布接口 90 秒
+                # 无响应盲等(2026-11-02 E2E 两连败根因)
+                if not cover_ok and not body_local_paths:
+                    raise RuntimeError(
+                        "[文章][百家号] 百家号文章封面必填"
+                        "（浮层拦截或无可用图）"
+                    )
 
                 # 5. 智能创作「自动生成播客」(平台默认勾选,False 时取消)
                 if podcast is False or str(podcast).strip().lower() in (
@@ -1373,12 +1509,39 @@ class BaijiahaoPlatform(BasePlatform):
                             "[文章][百家号] 定时设置失败(将立即发表): %s", e
                         )
 
+                # 提交前截图(全部字段填写完成,发布佐证)
+                try:
+                    await page.screenshot(
+                        path=str(
+                            log_dir
+                            / "baijiahao_article_before_submit.png"
+                        ),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[文章][百家号] 提交前截图失败(不影响发布): %s", e
+                    )
+
                 # 8. 保存 / 发表
                 if is_draft:
                     await self._save_article_draft(page)
                 else:
                     await self._publish_article_now(
                         page, scheduled=scheduled
+                    )
+
+                # 提交后截图(发布佐证,失败不影响发布)
+                try:
+                    await page.screenshot(
+                        path=str(
+                            log_dir / "baijiahao_article_after_submit.png"
+                        ),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[文章][百家号] 提交后截图失败(不影响发布): %s", e
                     )
 
                 await context.storage_state(path=cookie_path)
@@ -1424,6 +1587,9 @@ class BaijiahaoPlatform(BasePlatform):
                     )
                 except Exception:
                     pass
+                # 关闭平台广告弹窗(如「AI创作搭子」推广浮层, 会拦截后续
+                # 封面槽位/发布按钮的点击) — 必须在任何槽位交互前
+                await BaijiahaoPlatform._dismiss_platform_modals(page)
                 logger.info("[文章][百家号] 编辑器已就绪")
                 return
             await asyncio.sleep(1)
@@ -1698,6 +1864,8 @@ class BaijiahaoPlatform(BasePlatform):
         - cover_path 给出: 走「本地上传」显式上传该图。
         - 未给出 cover_path: 保持原行为 —— 打开弹窗后点「确定」,
           正文有图时平台自动选中正文首图。
+        返回 True/False 表示封面是否成功设置(调用方据此在「正文也无图」
+        时快速失败, 百家号封面必填, 不能静默跳过继续发布)。
         """
         extra = [
             str(p) for p in (extra_cover_paths or [])
@@ -1760,7 +1928,7 @@ class BaijiahaoPlatform(BasePlatform):
                 "[文章][百家号] 三图封面已设置: %d 张", filled_now
             )
             if filled_now >= 3:
-                return
+                return True
             # 平台三图槽位上传不稳定(第 3 张可能不生效) → 回退单图,
             # 保证「设置封面」必填项有值, 不阻塞发布
             logger.warning(
@@ -1769,14 +1937,14 @@ class BaijiahaoPlatform(BasePlatform):
             await BaijiahaoPlatform._set_cover_layout(page, "单图")
             await asyncio.sleep(2)
             if await BaijiahaoPlatform._count_cover_imgs(page) >= 1:
-                return
+                return True
             ok = await BaijiahaoPlatform._upload_one_cover_slot(
                 page, imgs[0], slot_index=0
             )
             logger.info(
                 "[文章][百家号] 单图封面上传: %s", "ok" if ok else "失败"
             )
-            return
+            return bool(ok)
 
         if single and Path(single).exists():
             ok = await BaijiahaoPlatform._upload_one_cover_slot(
@@ -1784,7 +1952,7 @@ class BaijiahaoPlatform(BasePlatform):
             )
             if ok:
                 logger.info("[文章][百家号] 显式封面已设置: %s", single)
-                return
+                return True
             logger.warning(
                 "[文章][百家号] 显式封面上传失败,尝试正文首图兜底"
             )
@@ -1808,7 +1976,7 @@ class BaijiahaoPlatform(BasePlatform):
         )
         if not pos:
             logger.warning("[文章][百家号] 未找到选择封面入口(跳过)")
-            return
+            return False
         await page.mouse.click(pos["x"], pos["y"])
         await asyncio.sleep(3)
         # 兜底弹窗「确定」也用 trusted click(平台不受理 JS 合成点击)
@@ -1836,10 +2004,18 @@ class BaijiahaoPlatform(BasePlatform):
                 "[文章][百家号][封面] 兜底弹窗「确定」不可用(正文无图?),封面跳过"
             )
             await BaijiahaoPlatform._close_cover_modal(page)
-            return
+            return False
         await page.mouse.click(btn["x"], btn["y"])
         await asyncio.sleep(3)
+        # 验证封面确实落槽(点击可能被「裁剪处理中」状态静默忽略)
+        filled = await BaijiahaoPlatform._count_cover_imgs(page)
+        if filled < 1:
+            logger.warning(
+                "[文章][百家号][封面] 兜底后封面仍未落槽(已填 %d)", filled
+            )
+            return False
         logger.info("[文章][百家号] 封面已设置(正文首图)")
+        return True
 
     @staticmethod
     async def _set_cover_layout(page, layout_text: str) -> bool:
@@ -1898,6 +2074,8 @@ class BaijiahaoPlatform(BasePlatform):
         流程: 点该槽位「选择封面」→ 弹窗 file input set_input_files →
         等「确定」可用 → 点确定。
         """
+        # 广告浮层可能随时再弹, 槽位点击前再清一次(遮罩会拦截点击)
+        await BaijiahaoPlatform._dismiss_platform_modals(page)
         pos = await page.evaluate(
             """(idx) => {
               const vis = (el) => {
@@ -1927,8 +2105,16 @@ class BaijiahaoPlatform(BasePlatform):
         try:
             await page.locator('#__bjh_slot_entry').click(timeout=10000)
         except Exception as e:
-            logger.warning("[文章][百家号][封面] 点击槽位失败: %s", e)
-            return False
+            # 浮层清理后仍可能被残留遮罩拦截(img intercepts pointer events),
+            # JS 点击兜底一次(2026-11-02 E2E)
+            logger.warning(
+                "[文章][百家号][封面] 点击槽位失败, 改用 JS 点击兜底: %s", e
+            )
+            if not await BaijiahaoPlatform._js_click_marked(
+                page, '__bjh_slot_entry'
+            ):
+                logger.warning("[文章][百家号][封面] JS 点击槽位也未命中")
+                return False
         await asyncio.sleep(2.5)
         # 只对「当前可见」的封面弹窗操作(历史弹窗节点会残留在 DOM)
         marked = await page.evaluate(
@@ -2039,9 +2225,16 @@ class BaijiahaoPlatform(BasePlatform):
         try:
             await page.locator('#__bjh_confirm_btn').click(timeout=15000)
         except Exception as e:
-            logger.warning("[文章][百家号][封面] 点击「确定」失败: %s", e)
-            await BaijiahaoPlatform._close_cover_modal(page)
-            return False
+            # 浮层残留遮罩拦截时的 JS 点击兜底(2026-11-02 E2E)
+            logger.warning(
+                "[文章][百家号][封面] 点击「确定」失败, 改用 JS 点击兜底: %s", e
+            )
+            if not await BaijiahaoPlatform._js_click_marked(
+                page, '__bjh_confirm_btn'
+            ):
+                logger.warning("[文章][百家号][封面] JS 点击「确定」也未命中")
+                await BaijiahaoPlatform._close_cover_modal(page)
+                return False
         logger.info("[文章][百家号][封面] 已点击确定,验证落槽…")
 
         async def _verify_settled(budget_s: int):
@@ -2076,7 +2269,12 @@ class BaijiahaoPlatform(BasePlatform):
             try:
                 await page.locator('#__bjh_confirm_btn').click(timeout=10000)
             except Exception as e:
-                logger.warning("[文章][百家号][封面] 补点失败: %s", e)
+                logger.warning(
+                    "[文章][百家号][封面] 补点失败, 改用 JS 点击兜底: %s", e
+                )
+                await BaijiahaoPlatform._js_click_marked(
+                    page, '__bjh_confirm_btn'
+                )
             ok, filled = await _verify_settled(20)
         if not ok:
             logger.warning(
@@ -2113,6 +2311,74 @@ class BaijiahaoPlatform(BasePlatform):
             await asyncio.sleep(1)
         except Exception:
             pass
+
+    @staticmethod
+    async def _dismiss_platform_modals(page, max_rounds: int = 3):
+        """关闭平台广告/公告弹窗(cheetah-modal, 点弹窗内 aria-label="关闭" 按钮)。
+
+        编辑页会常驻弹出「AI创作搭子」等 840px 广告弹窗(cheetah-modal),
+        遮罩会拦截封面槽位/发布按钮的点击(2026-11-02 E2E 文章发布两连败
+        根因)。检测可见的 role=dialog 弹窗并点其内部的「关闭」按钮 ——
+        注意不要点「立即体验」等 CTA; trusted click 失败回退 JS 点击;
+        每轮关一张、最多 max_rounds 轮防死循环; 任何失败静默返回,
+        绝不阻塞发布主流程。文章/视频编辑页均需在交互前调用。
+        """
+        for _ in range(max_rounds):
+            try:
+                marked = await page.evaluate(
+                    """() => {
+                      const vis = (el) => {
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 && r.height > 0;
+                      };
+                      const modals = [...document.querySelectorAll(
+                          '.cheetah-modal[role="dialog"]')].filter(vis);
+                      for (const m of modals) {
+                        const btn = [...m.querySelectorAll('button')].find(
+                          (b) => (b.getAttribute('aria-label') || '') === '关闭'
+                            && vis(b));
+                        if (!btn) continue;
+                        btn.id = '__bjh_modal_close_btn';
+                        return true;
+                      }
+                      return false;
+                    }"""
+                )
+                if not marked:
+                    return
+                try:
+                    await page.locator('#__bjh_modal_close_btn').click(
+                        timeout=3000
+                    )
+                except Exception:
+                    # 遮罩重绘等偶发原因导致 trusted click 失败, JS 点击兜底
+                    await BaijiahaoPlatform._js_click_marked(
+                        page, '__bjh_modal_close_btn'
+                    )
+                logger.info("[百家号][弹窗] 已关闭平台广告弹窗")
+                await asyncio.sleep(1.5)
+            except Exception:
+                return
+
+    @staticmethod
+    async def _js_click_marked(page, element_id: str) -> bool:
+        """对已标记 id 的元素做 JS 合成点击兜底(返回是否命中元素)。
+
+        平台(cheetah UI)部分按钮不受理 JS 合成点击, 故仅作 trusted click
+        失败后的兜底, 不替代主点击路径。
+        """
+        try:
+            return await page.evaluate(
+                """(eid) => {
+                  const el = document.getElementById(eid);
+                  if (!el) return false;
+                  el.click();
+                  return true;
+                }""",
+                element_id,
+            )
+        except Exception:
+            return False
 
     @staticmethod
     async def _set_article_podcast(page, enabled: bool):
@@ -2750,6 +3016,9 @@ class BaijiahaoPlatform(BasePlatform):
         """
         import json as _json
 
+        # 发布前再清一次广告浮层(遮罩会拦截「发布」按钮的点击,
+        # 导致 /pcui/article/publish 请求根本发不出去)
+        await BaijiahaoPlatform._dismiss_platform_modals(page)
         # 点击放 expect_response 上下文内
         try:
             async with page.expect_response(
@@ -2888,3 +3157,209 @@ class BaijiahaoPlatform(BasePlatform):
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         return path
+
+    # ------------------------------------------------------------------
+    # list_works -- 作品列表抓取(作品链接 + 播放/点赞/评论统计)
+    # ------------------------------------------------------------------
+
+    # 内容管理页(侧边栏「内容管理 → 作品管理」的落地页, 2026-11-02 踩点)。
+    # 页面本身是 React SPA, 列表数据来自 JSON 接口 GET /pcui/article/lists,
+    # 页内 fetch + credentials 直调即可(无签名; 模式同头条 _fetch_platform_json)。
+    _MANAGE_CONTENT_URL = (
+        "https://baijiahao.baidu.com/builder/rc/content"
+        "?currentPage=1&pageSize=10&search=&type=&collection=&startDate=&endDate="
+    )
+
+    # work_type -> 接口 type 参数(踩点实测, 见 scratch/scout_baijiahao4.py):
+    #   'article' → type=news  (图文文章, url 字段即公开页 s?id=<id>)
+    #   'video'   → type=      (留空抓全量再按条目 type 过滤:
+    #               2026-11-02 E2E 实测新发布视频条目 type=ugc_video, 旧视频
+    #               才是 video, 固定 type=video 永远抓不到新视频 → 回链/统计
+    #               结构性为空, 故视频改抓全量后按 _VIDEO_ITEM_TYPES 过滤)
+    #   'image' 图集: 平台 2026-08 已下线图集功能且路由表不支持 → 返回 []
+    _LISTS_TYPE_PARAM = {
+        "article": "news",
+        "video": "",  # 留空取全量, 再按条目 type 字段过滤(见下)
+    }
+
+    # 视频类条目的 type 字段集合: video=旧版视频, ugc_video=新版小视频
+    # (2026-11 E2E 实测新发布视频均为 ugc_video, 两者统计字段名一致)
+    _VIDEO_ITEM_TYPES = {"video", "ugc_video"}
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取百家号「作品管理」页已发布作品列表(按发布时间倒序)。
+
+        复用 sync_profile 骨架: headless + storage_state → 打开内容管理页
+        校验登录态 → 页内 fetch 直调 /pcui/article/lists(collection=publish
+        只取已发布)。按契约任何失败(类型不支持/cookie 失效/改版/异常)都
+        log 后返回 []，绝不抛异常。
+        """
+        type_param = self._LISTS_TYPE_PARAM.get(work_type or "")
+        if type_param is None:
+            if work_type:
+                logger.info(
+                    f"[baijiahao] list_works 不支持 work_type={work_type!r}, 返回空"
+                )
+            return []
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        if not os.path.exists(cookie_path):
+            logger.info(f"[baijiahao] list_works cookie 文件不存在: {cookie_file}")
+            return []
+
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(
+                browser, storage_state=cookie_path
+            )
+            try:
+                page = await context.new_page()
+                # 打开内容管理页建立登录态(同源后页内 fetch 才带凭证)
+                await page.goto(
+                    self._MANAGE_CONTENT_URL,
+                    wait_until="domcontentloaded",
+                    timeout=30000,
+                )
+                # SPA 路由会二次导航( URL 规范化), 过早 evaluate 会报
+                # "Execution context was destroyed", 等 load 后再稳 3 秒
+                try:
+                    await page.wait_for_load_state("load", timeout=15000)
+                except Exception:
+                    pass
+                await asyncio.sleep(3)
+
+                # 登录态校验: 跳到任一失效 marker / 跳出业务域即失效
+                current_url = page.url or ""
+                for marker in self._COOKIE_INVALID_URL_MARKERS:
+                    if marker in current_url:
+                        logger.info(
+                            f"[baijiahao] list_works cookie 失效"
+                            f"(matched: {marker})"
+                        )
+                        return []
+                if not current_url.startswith("https://baijiahao.baidu.com/"):
+                    logger.info(
+                        f"[baijiahao] list_works 页面跳出业务域: {current_url}"
+                    )
+                    return []
+
+                # 页内 fetch 直调列表接口(collection=publish 只取已发布)。
+                # SPA 二次导航可能摧毁执行上下文, 最多重试 3 次
+                qs = (
+                    f"currentPage=1&pageSize={int(limit)}&search="
+                    f"&type={type_param}&collection=publish"
+                    f"&startDate=&endDate=&dynamic=1"
+                )
+                raw = None
+                for attempt in range(3):
+                    try:
+                        raw = await page.evaluate(
+                            """async (qs) => {
+                                const resp = await fetch(
+                                    'https://baijiahao.baidu.com/pcui/article/lists?'
+                                      + qs,
+                                    {credentials: 'include',
+                                     headers: {'accept': 'application/json'}});
+                                return await resp.json();
+                            }""",
+                            qs,
+                        )
+                        break
+                    except Exception as exc:
+                        if attempt == 2:
+                            logger.info(
+                                f"[baijiahao] list_works 页内 fetch 失败: {exc}"
+                            )
+                            return []
+                        await asyncio.sleep(2)
+                if not isinstance(raw, dict) or raw.get("errno") != 0:
+                    logger.info(
+                        f"[baijiahao] list_works 接口返回异常: {str(raw)[:200]}"
+                    )
+                    return []
+
+                items = (raw.get("data") or {}).get("list") or []
+                works = []
+                for item in items:
+                    # 双保险: 只收已发布(接口已按 collection=publish 过滤)
+                    if item.get("status") and item.get("status") != "publish":
+                        continue
+                    # 条目类型过滤: video 请求 type= 抓的是全量(含图文), 按条目
+                    # 自身 type 收(video/ugc_video 都算视频); article(type=news)
+                    # 接口已过滤, 条目带 type 时仅做双保险
+                    item_type = str(item.get("type") or "")
+                    if item_type:
+                        if work_type == "video":
+                            if item_type not in self._VIDEO_ITEM_TYPES:
+                                continue
+                        elif type_param and item_type != type_param:
+                            continue
+                    work_id = str(
+                        item.get("article_id") or item.get("id") or ""
+                    )
+                    works.append({
+                        "work_id": work_id,
+                        "work_type": work_type,
+                        "title": str(item.get("title") or ""),
+                        "publish_time": str(item.get("publish_time") or ""),
+                        "url": self._pick_work_url(item, work_id, work_type),
+                        # 行内统计: 阅读(播放)/点赞/收藏/评论/分享, 缺失为 None
+                        "views": self._to_int(item.get("read_amount")),
+                        "likes": self._to_int(item.get("like_amount")),
+                        "favorites": self._to_int(
+                            item.get("collection_amount")
+                        ),
+                        "comments": self._to_int(item.get("comment_amount")),
+                        "share": self._to_int(item.get("share_amount")),
+                    })
+                logger.info(
+                    f"[baijiahao] list_works(work_type={work_type}, "
+                    f"limit={limit}) 抓到 {len(works)} 条"
+                )
+                return works
+            finally:
+                await context.close()
+        except Exception as exc:
+            logger.info(f"[baijiahao] list_works 抓取失败: {exc}")
+            return []
+        finally:
+            await browser.close()
+
+    @staticmethod
+    def _pick_work_url(item: dict, work_id: str, work_type: str = "") -> str:
+        """从列表条目挑公开作品 URL。
+
+        - 视频(video/ugc_video): 公开页取 share_url(mbd.baidu.com 落地页,
+          ugc_video 形如 newspage/data/dtlandingwise?...&nid=dt_<nid>);
+          url 字段是 builder/preview 内部预览壳(无登录态时仅 72 字节跳转
+          存根), share_url 缺失时兜底拼 s?id 公开页(实测视频 s?id 同样
+          200 可访问)
+        - 图文: url 字段即公开页 baijiahao.baidu.com/s?id=<id>
+        """
+        raw_url = str(item.get("url") or "")
+        share_url = str(item.get("share_url") or "")
+        share_ok = share_url.startswith(("http://", "https://")) and "." in share_url
+        # 视频: share_url 是公开落地页, 优先于预览壳/内部 url
+        if work_type == "video" and share_ok:
+            return share_url
+        if "builder/preview" in raw_url:
+            if share_ok:
+                return share_url
+            return (
+                f"https://baijiahao.baidu.com/s?id={work_id}" if work_id else ""
+            )
+        if raw_url.startswith(("http://", "https://")) and "." in raw_url:
+            return raw_url
+        return ""
+
+    @staticmethod
+    def _to_int(v) -> "int | None":
+        """平台统计字段转 int(空/非法 → None, 契约约定缺失为 null)。"""
+        if v is None or v == "":
+            return None
+        try:
+            return int(str(v).strip())
+        except (ValueError, TypeError):
+            return None

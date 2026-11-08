@@ -2941,6 +2941,197 @@ class ZhihuPlatform(BasePlatform):
             )
         raise RuntimeError(f"知乎文章发表失败 code={code} message={msg}")
 
+    # ------------------------------------------------------------------
+    # list_works — 作品列表抓取(作品回链 + 数据统计同步的数据源)
+    # ------------------------------------------------------------------
+
+    # 内容管理页数据接口(2026-11 踩点实证, scratch/zhihu_api_capture*.json):
+    #   GET https://www.zhihu.com/api/v4/creators/creations/v2/<tab>
+    #       ?start=0&end=0&limit=20&offset=0&need_co_creation=1&sort_type=created
+    #   tab 与内容管理页 /creator/manage/creation/<tab> 一一对应:
+    #   all/answer/pin/question/article/zvideo/podcast/column/draft
+    #   响应: {paging: {is_end, totals}, data: [{type, data: {id, url_token,
+    #     title, content, created_time, ...}, reaction: {read_count,
+    #     play_count, vote_up_count, like_count, collect_count,
+    #     comment_count, ...}}]}
+    _CREATIONS_API = "https://www.zhihu.com/api/v4/creators/creations/v2/{tab}"
+    # 列表页 URL(goto 用, 建立 www.zhihu.com 同源上下文, fetch 才带得上门禁 cookie)
+    _MANAGE_CREATION_URL = "https://www.zhihu.com/creator/manage/creation/{tab}"
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取创作中心「内容管理」页的作品列表(按发布时间倒序)。
+
+        work_type 路由: 'video' → creations/v2/zvideo tab,
+        'article' → creations/v2/article tab。知乎不支持图文/图集
+        ('image' → []), 传空也返回 [](知乎无单一列表页通吃)。
+
+        数据源选 JSON 接口而非 DOM scrape: 管理页 DOM 的数字与
+        标签耦合 css-hash 类名, 接口字段稳定且带作品 id/发布时间戳。
+        想法视频(pin, 上传视频经"想法"发布)在本 tab 返回且
+        reaction.play_count 即播放数, 公开链接为 zhihu.com/pin/<id>;
+        纯 zvideo 类型(若有)拼 zhihu.com/zvideo/<id>。
+        抓取失败/cookie 失效 → 返回 [](契约要求不抛异常)。
+        """
+        tab_by_type = {"video": "zvideo", "article": "article"}
+        tab = tab_by_type.get(work_type)
+        if tab is None:
+            return []
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+            try:
+                # 打开内容管理页建立同源上下文; 未登录会被重定向出 /creator/
+                try:
+                    await page.goto(
+                        self._MANAGE_CREATION_URL.format(tab=tab),
+                        wait_until="domcontentloaded",
+                        timeout=20000,
+                    )
+                except Exception as exc:
+                    logger.info(f"[zhihu list_works] 打开内容管理页失败: {exc}")
+                if "/creator/" not in (page.url or ""):
+                    logger.info(
+                        f"[zhihu list_works] cookie 失效/未登录(当前 {page.url})"
+                    )
+                    return []
+
+                works: list[dict] = []
+                page_size = 20  # 接口实测单页上限口径, 超出靠 offset 翻页
+                offset = 0
+                while len(works) < limit:
+                    body = await page.evaluate(
+                        """async ({api, limit, offset}) => {
+                            const url = `${api}?start=0&end=0&limit=${limit}`
+                                      + `&offset=${offset}&need_co_creation=1`
+                                      + `&sort_type=created`;
+                            const resp = await fetch(url, {
+                                credentials: 'include',
+                            });
+                            if (!resp.ok) {
+                                return {ok: false, status: resp.status};
+                            }
+                            return {ok: true, status: resp.status,
+                                    body: await resp.json()};
+                        }""",
+                        {
+                            "api": self._CREATIONS_API.format(tab=tab),
+                            "limit": page_size,
+                            "offset": offset,
+                        },
+                    )
+                    if not body.get("ok"):
+                        logger.info(
+                            f"[zhihu list_works] 接口请求失败 "
+                            f"status={body.get('status')}(cookie 失效或风控)"
+                        )
+                        return []
+                    payload = body.get("body") or {}
+                    rows = payload.get("data") or []
+                    if not rows:
+                        break
+                    for row in rows:
+                        works.append(
+                            self._normalize_creation_row(row, work_type))
+                    paging = payload.get("paging") or {}
+                    if paging.get("is_end") or len(rows) < page_size:
+                        break
+                    offset += page_size
+                return works[:limit]
+            except Exception as exc:
+                logger.info(f"[zhihu list_works] 抓取失败: {exc}")
+                return []
+            finally:
+                await page.close()
+                await context.close()
+        finally:
+            await browser.close()
+
+    @staticmethod
+    def _pin_title(row_data: dict) -> str:
+        """从想法(pin)条目提取标题。
+
+        content 是块列表: 文本块自带 title 字段(如 '杨氏之子');
+        兜底剥掉第一个块的 HTML 标签取纯文本。
+        """
+        blocks = row_data.get("content") or []
+        for block in blocks:
+            title = str(block.get("title") or "").strip()
+            if title:
+                return title
+        for block in blocks:
+            html = str(block.get("content") or "")
+            if html:
+                return _re_module.sub(r"<[^>]+>", "", html).strip()
+        return ""
+
+    @staticmethod
+    def _normalize_creation_row(row: dict, work_type: str) -> dict:
+        """把 creations/v2 接口的一行归一化为 list_works 契约 dict。
+
+        字段映射(踩点实证):
+          views    = article→read_count(阅读) / video→play_count(播放,
+                     想法视频 play 为空时回退 read_count)
+          likes    = vote_up_count(赞同, 知乎主互动; like_count 是轻量
+                     "喜欢", 契约无对应格, 丢弃)
+          favorites= collect_count  comments = comment_count
+          share    = None(列表接口不提供分享数)
+        """
+        data = row.get("data") or {}
+        reaction = row.get("reaction") or {}
+        row_type = row.get("type") or ""
+        work_id = str(data.get("id") or "")
+        url_token = str(data.get("url_token") or work_id)
+
+        if row_type == "article":
+            url = f"https://zhuanlan.zhihu.com/p/{url_token}"
+            title = str(data.get("title") or "")
+            views = reaction.get("read_count")
+        elif row_type == "zvideo":
+            url = f"https://www.zhihu.com/zvideo/{work_id}"
+            title = str(data.get("title") or "")
+            views = reaction.get("play_count")
+        elif row_type == "pin":
+            # 上传视频走"想法"发布 → type=pin, 公开页 zhihu.com/pin/<id>
+            url = f"https://www.zhihu.com/pin/{work_id}"
+            title = ZhihuPlatform._pin_title(data)
+            views = reaction.get("play_count")
+            if views is None:
+                views = reaction.get("read_count")
+        else:
+            # 其它类型(answer/question/podcast/column)不该出现在这两个
+            # tab, 出现时保守处理: 不猜公开 URL
+            url = ""
+            title = str(data.get("title") or "")
+            views = reaction.get("read_count")
+
+        created = data.get("created_time")
+        try:
+            publish_time = time.strftime(
+                "%Y-%m-%d %H:%M:%S", time.localtime(int(created)))
+        except (TypeError, ValueError):
+            publish_time = ""
+
+        def _count(value) -> int | None:
+            return int(value) if isinstance(value, (int, float)) else None
+
+        return {
+            "work_id": work_id,
+            "work_type": work_type,
+            "title": title,
+            "publish_time": publish_time,
+            "url": url,
+            "views": _count(views),
+            "likes": _count(reaction.get("vote_up_count")),
+            "favorites": _count(reaction.get("collect_count")),
+            "comments": _count(reaction.get("comment_count")),
+            "share": None,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Calendar label parsing helpers (used by _set_schedule_time)

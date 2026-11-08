@@ -1267,6 +1267,10 @@ class ChannelsPlatform(BasePlatform):
     supports_cookie_import = True
     platform_cookie_domain = ".qq.com"
 
+    # 视频发布支持「存草稿」:is_draft=True 时点「保存草稿」而非发表
+    # (_submit_publish 已按 is_draft 分流)
+    supports_video_draft = True
+
     def _parse_cookie_to_storage_state(self, cookie_str):
         cookies = []
         expires = time.time() + BasePlatform._IMPORT_COOKIE_EXPIRES_SECONDS
@@ -1574,6 +1578,10 @@ class ChannelsPlatform(BasePlatform):
         - ``desc`` (*str*, optional)
         - ``schedule_time_str`` (*str*, optional)
         """
+        # 表单截图目录(供 E2E 测试报告做平台表单填写佐证)
+        log_dir = Path(BASE_DIR / "logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+
         logger.info("=" * 60)
         logger.info("[发布视频] 开始视频号视频发布流程")
         logger.info("=" * 60)
@@ -1698,6 +1706,15 @@ class ChannelsPlatform(BasePlatform):
                             # Upload video file
                             await _upload_video_file(page, file_path)
 
+                            # 表单截图钩子: 表单渲染就绪(供 E2E 报告佐证)
+                            try:
+                                await page.screenshot(
+                                    path=str(log_dir / "channels_before_form.png"),
+                                    full_page=True,
+                                )
+                            except Exception as exc:
+                                logger.warning("[截图钩子] before_form 截图失败(不影响发布): %s", exc)
+
                             # Fill metadata
                             # title → 短标题输入框（_set_short_title，稍后填）
                             # 正文/描述区 → desc + tags
@@ -1745,6 +1762,15 @@ class ChannelsPlatform(BasePlatform):
                             await _set_short_title(page, title)
                             await pause_after_input()
 
+                            # 表单截图钩子: 全部字段填写完成、点击发表前(供 E2E 报告核心佐证)
+                            try:
+                                await page.screenshot(
+                                    path=str(log_dir / "channels_before_submit.png"),
+                                    full_page=True,
+                                )
+                            except Exception as exc:
+                                logger.warning("[截图钩子] before_submit 截图失败(不影响发布): %s", exc)
+
                             # 调试:输出本次发布的全部参数
                             logger.info("=" * 60)
                             logger.info("[发布调试] ===== 本次发布参数汇总 (dry_run=%s) =====", _PUBLISH_DRY_RUN)
@@ -1781,6 +1807,15 @@ class ChannelsPlatform(BasePlatform):
 
                             # Submit
                             await _submit_publish(page, is_draft)
+
+                            # 表单截图钩子: 发表提交成功后、流程收尾前(供 E2E 报告佐证)
+                            try:
+                                await page.screenshot(
+                                    path=str(log_dir / "channels_after_submit.png"),
+                                    full_page=True,
+                                )
+                            except Exception as exc:
+                                logger.warning("[截图钩子] after_submit 截图失败(不影响发布): %s", exc)
 
                             # Update stored cookies
                             await context.storage_state(path=cookie_path)

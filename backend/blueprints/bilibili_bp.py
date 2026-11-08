@@ -1,8 +1,8 @@
 """B 站创作者平台相关 API 代理(纯 HTTP 轻量方案)。
 
-合集列表 / 参与话题列表均直连 B站创作中心接口:
+合集列表 / 参与话题列表 / 话题搜索均直连 B站创作中心接口:
 从 cookie 文件解析登录态 → requests 带 Cookie/UA/Referer 请求 → 毫秒级返回。
-两个接口均经投稿页抓包确认无需 wbi 签名(2026-10)。
+三个接口均经投稿页抓包确认无需 wbi 签名(合集/推荐 2026-10, 搜索 2026-11-07)。
 
 历史:合集列表旧实现走浏览器 UI 解析(开上传页→传测试视频→点「请选择合集」
 →解析浮层 DOM),单次请求 30-60s、每次都向 B 站上传一个测试视频,且 B 站
@@ -36,6 +36,9 @@ _BILI_UPLOAD_URL = "https://member.bilibili.com/platform/upload/video/frame"
 _BILI_SEASONS_API = "https://member.bilibili.com/x2/creative/web/seasons"
 # 参与话题接口(同上,按标题相关性推荐)
 _BILI_TOPIC_API = "https://member.bilibili.com/x/vupre/web/topic/type/v2"
+# 话题搜索接口(2026-11-07 投稿页「搜索更多话题」弹层抓包确认:
+# GET keywords/page_size/offset 三参数,无 wbi 签名,登录 cookie 即可)
+_BILI_TOPIC_SEARCH_API = "https://member.bilibili.com/x/vupre/web/topic/search"
 
 _UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -199,4 +202,67 @@ def list_topics():
         return jsonify({"code": 200, "data": {"list": items, "total": len(items)}})
     except Exception as e:
         logger.error(f"[话题列表] 异常: {e}", exc_info=True)
+        return jsonify({"code": 500, "msg": str(e)}), 500
+
+
+@bilibili_bp.route('/topic-search', methods=['GET'])
+def search_topics():
+    """按关键词搜索 B 站话题(投稿表单「参与话题」搜索数据源)。
+
+    数据源(2026-11-07 弹层抓包):GET /x/vupre/web/topic/search,
+    参数 keywords/page_size/offset;返回结构与推荐接口不同
+    (data.result.topics[]: id/name/description/activity_sign/act_protocol),
+    这里归一化成与 /topics 一致的 item 结构,前端组件无需区分。
+
+    Query params:
+        account_id: 账号 id(用于取 cookie)
+        keyword:    搜索关键词(必填)
+
+    Returns:
+        {"code": 200, "data": {"list": [{"topicId","name","activityText",
+         "activityDescription","playVv"}...], "total": N}}
+    """
+    account_id = request.args.get('account_id')
+    keyword = (request.args.get('keyword') or '').strip()
+    logger.info(f"[话题搜索] 收到请求: account_id={account_id} keyword={keyword!r}")
+
+    if not keyword:
+        return jsonify({"code": 400, "msg": "缺少keyword参数"}), 400
+
+    try:
+        cookie_file = _get_account_cookie_file(account_id)
+        if not cookie_file:
+            logger.warning(f"[话题搜索] 账号不存在: {account_id}")
+            return jsonify({"code": 404, "msg": "没有可用的 B 站账号"}), 404
+
+        cookie_path = _get_cookie_path(cookie_file)
+        params = {
+            "keywords": keyword,
+            "page_size": "50",
+            "offset": "0",
+            "t": str(int(time.time() * 1000)),
+        }
+        query = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in params.items())
+        body = _bili_api_get(f"{_BILI_TOPIC_SEARCH_API}?{query}", cookie_path)
+        if body.get("code") != 0:
+            msg = f"B站接口返回异常: code={body.get('code')} {body.get('message', '')}"
+            logger.error(f"[话题搜索] {msg}")
+            return jsonify({"code": 500, "msg": msg}), 500
+
+        topics = ((body.get("data") or {}).get("result") or {}).get("topics") or []
+        items = [
+            {
+                "topicId": t.get("id"),
+                "name": t.get("name", ""),
+                "activityText": t.get("activity_sign") or "",
+                "activityDescription": t.get("act_protocol") or "",
+                "playVv": t.get("arc_play_vv", 0),
+            }
+            for t in topics
+            if t.get("name")
+        ]
+        logger.info(f"[话题搜索] 成功,共 {len(items)} 个话题")
+        return jsonify({"code": 200, "data": {"list": items, "total": len(items)}})
+    except Exception as e:
+        logger.error(f"[话题搜索] 异常: {e}", exc_info=True)
         return jsonify({"code": 500, "msg": str(e)}), 500

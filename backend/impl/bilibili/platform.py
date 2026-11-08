@@ -104,6 +104,10 @@ class BilibiliPlatform(BasePlatform):
     platform_key = "bilibili"
     platform_name = "B站"
 
+    # 视频发布支持「存草稿」:is_draft=True 时点「存草稿」(span.submit-draft)
+    # 保存到 B 站草稿箱而非立即投稿(2026-11-07 踩点)
+    supports_video_draft = True
+
     # 支持 cookie 字符串导入账号
     supports_cookie_import = True
     # B站 cookie 全部由 .bilibili.com 域下发，覆盖 account/member 子域
@@ -487,6 +491,8 @@ class BilibiliPlatform(BasePlatform):
         - ``thumbnail_portrait_path`` (*str*, optional) -- portrait cover
         - ``schedule_time_str`` (*str*, optional)
         - ``creation_declaration`` (*str*, optional)
+        - ``is_draft`` (*bool*, optional) -- True=点「存草稿」保存到 B 站官方
+          草稿箱而不真正投稿(表单其余内容照常填写)
         """
 
         async def _run():
@@ -533,6 +539,8 @@ class BilibiliPlatform(BasePlatform):
             bili_featured_comment = bool(kwargs.get("bili_featured_comment", False))
             # B 站粉丝动态文案(发布时同步一条动态,最多 233 字)
             bili_fans_dynamic = kwargs.get("bili_fans_dynamic", "")
+            # 「存草稿」模式(True=点「存草稿」存到 B 站草稿箱,不真正投稿)
+            is_draft = bool(kwargs.get("is_draft", False))
 
             # 打印发布参数摘要
             logger.info("[发布参数] 标题: %s", title)
@@ -544,6 +552,7 @@ class BilibiliPlatform(BasePlatform):
             logger.info("[发布参数] 横版封面: %s", thumbnail_landscape or "无")
             logger.info("[发布参数] 创作声明: %s", creation_declaration or "无")
             logger.info("[发布策略] 发布策略: %s", "scheduled" if enable_timer and schedule_time_str else "immediate")
+            logger.info("[发布策略] 存草稿模式: %s", is_draft)
 
             # Resolve full paths
             cookie_paths = [
@@ -600,6 +609,7 @@ class BilibiliPlatform(BasePlatform):
                             bili_close_comment=bili_close_comment,
                             bili_featured_comment=bili_featured_comment,
                             bili_fans_dynamic=bili_fans_dynamic,
+                            is_draft=is_draft,
                         )
 
             logger.info("=" * 60)
@@ -633,6 +643,7 @@ class BilibiliPlatform(BasePlatform):
         bili_close_comment: bool = False,
         bili_featured_comment: bool = False,
         bili_fans_dynamic: str = "",
+        is_draft: bool = False,
     ):
         """Upload a single video to Bilibili using CloakBrowser."""
         log_dir = Path(BASE_DIR / "logs")
@@ -790,6 +801,45 @@ class BilibiliPlatform(BasePlatform):
 
                 if manual_review_enabled():
                     await wait_for_manual_publish(page, 'bilibili')
+                elif is_draft:
+                    # 「存草稿」模式:表单内容(标题/描述/标签/封面/话题/定时等)
+                    # 已全部照常填写,这里点「存草稿」保存到 B 站草稿箱,不投稿。
+                    # DOM(2026-11-07 踩点):底部按钮区 span.submit-draft「存草稿」,
+                    # 旁边是 span.submit-add「立即投稿」。
+                    logger.info("[存草稿] 存草稿模式:点击「存草稿」按钮...")
+                    await page.evaluate(
+                        "window.scrollTo(0, document.body.scrollHeight)"
+                    )
+                    await asyncio.sleep(1)
+                    draft_btn = page.locator(".submit-draft").first
+                    if await draft_btn.count() == 0:
+                        draft_btn = page.get_by_text("存草稿", exact=True).first
+                    if await draft_btn.count() == 0:
+                        raise RuntimeError("B 站投稿页未找到「存草稿」按钮")
+                    await draft_btn.scroll_into_view_if_needed()
+                    await draft_btn.click()
+                    # 等保存确认(常见为「保存成功」toast);未捕获到提示时按
+                    # 「可能已保存」放行 —— 存草稿没有公开内容,宁可宽不可误报失败
+                    saved_toast = False
+                    for _ in range(15):
+                        await asyncio.sleep(1)
+                        if await page.get_by_text("保存成功").count() > 0:
+                            saved_toast = True
+                            break
+                    if saved_toast:
+                        logger.info("[存草稿] 草稿保存成功(B 站提示「保存成功」)")
+                    else:
+                        logger.warning(
+                            "[存草稿] 未捕获到「保存成功」提示,草稿可能已保存,"
+                            "请到 B 站「稿件管理-草稿箱」确认"
+                        )
+                    try:
+                        await page.screenshot(
+                            path=str(log_dir / "bilibili_after_draft.png"),
+                            full_page=True,
+                        )
+                    except Exception:
+                        pass
                 else:
                     # 10. Submit（自动提交，默认）
                     logger.info("[上传视频] submitting video")
@@ -1839,7 +1889,8 @@ class BilibiliPlatform(BasePlatform):
         (chip 文本=话题名,带「活动」角标),右侧「搜索更多话题 >」入口
         点开搜索弹层。策略:
           1. 「参与话题」行内按话题名精确匹配 chip → 点击
-          2. 行内没有 → 点「搜索更多话题」→ 弹层内精确匹配候选 → 点击
+          2. 行内没有 → 点「搜索更多话题」→ 弹层输入框输入话题名触发
+             搜索 → 精确匹配候选 → 点击
         全程失败不阻塞发布(话题是可选项)。
         """
         if not topic_name:
@@ -1876,7 +1927,13 @@ class BilibiliPlatform(BasePlatform):
 
     @staticmethod
     async def _pick_topic_via_search(page, topic_name: str) -> None:
-        """打开「搜索更多话题」弹层并选择指定话题。"""
+        """打开「搜索更多话题」弹层,输入话题名搜索并选中。
+
+        DOM(2026-11-07 踩点):弹层为 .bcc-dialog,内含 1 个搜索输入框
+        (placeholder「请输入」),逐字输入触发 GET /x/vupre/web/topic/search
+        并刷新候选列表(输入事件防抖,无需回车)。
+        流程:点入口 → 弹层输入框输入话题名 → 轮询等候选出现 → 点精确匹配项。
+        """
         entry = page.get_by_text("搜索更多话题", exact=False)
         if await entry.count() == 0:
             logger.warning("[参与话题] 未找到「搜索更多话题」入口,跳过")
@@ -1887,8 +1944,38 @@ class BilibiliPlatform(BasePlatform):
             pass
         await entry.first.click(timeout=5000)
         await asyncio.sleep(2)
-        # 弹层内候选:精确文本匹配(不会命中含长文本的容器节点)
-        candidate = page.get_by_text(topic_name, exact=True)
+
+        # 弹层内搜索框:限定 .bcc-dialog 范围,避免命中主页面标题输入框
+        dialog = page.locator(".bcc-dialog").first
+        search_input = None
+        if await dialog.count() > 0:
+            dialog_input = dialog.locator("input:visible").first
+            if await dialog_input.count() > 0:
+                search_input = dialog_input
+        if search_input is None:
+            search_input = page.locator("input[placeholder*='请输入']").first
+        try:
+            await search_input.click(timeout=5000)
+            await search_input.fill("")
+            await search_input.type(topic_name, delay=150)
+        except Exception as e:
+            logger.warning("[参与话题] 弹层搜索框输入失败: %s", e)
+            await BilibiliPlatform._close_topic_dialog(page)
+            return
+
+        # 等搜索结果渲染(接口约 1s;轮询最多 10s):先精确匹配,退而子串匹配
+        candidate = dialog.get_by_text(topic_name, exact=True)
+        for _ in range(20):
+            if await candidate.count() > 0:
+                break
+            await asyncio.sleep(0.5)
+        if await candidate.count() == 0:
+            candidate = dialog.get_by_text(topic_name, exact=False)
+            for _ in range(6):
+                if await candidate.count() > 0:
+                    break
+                await asyncio.sleep(0.5)
+
         count = await candidate.count()
         logger.info("[参与话题] 搜索弹层精确匹配到 %d 个候选", count)
         for i in range(count):
@@ -2019,3 +2106,115 @@ class BilibiliPlatform(BasePlatform):
             logger.info("[定时发布] schedule time set")
         except Exception as exc:
             logger.info(f"[定时发布] schedule time setting failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # List works (作品列表抓取)
+    # ------------------------------------------------------------------
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取稿件管理页的作品列表（按发布时间倒序）。
+
+        实现（2026-11 踩点）：稿件管理页 BILIBILI_MANAGE_URL 加载后，页面自己
+        会请求 ``member.bilibili.com/x/web/archives``（含转码中 is_pubing），
+        返回 arc_audits[].Archive（bvid/title/state_desc/ctime/ptime） +
+        arc_audits[].stat（view/danmaku/reply/favorite/coin/share/like）。
+        这里用页内 fetch 直调同一接口（credentials 自动带 cookie），比解析
+        hash class 的 DOM 稳定，且 ps 可控。
+
+        work_type 仅支持 'video'（B站只有视频稿件）；其它类型 → []。
+        异常一律 log + return []，不影响调用方。
+        """
+        if work_type != "video":
+            return []
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+            try:
+                await page.goto(
+                    BILIBILI_MANAGE_URL, wait_until="domcontentloaded", timeout=30000
+                )
+                await asyncio.sleep(3)
+                if "passport.bilibili.com" in page.url:
+                    logger.info("[bilibili list_works] cookie 失效(跳到登录页)")
+                    return []
+
+                ps = max(1, min(int(limit or 20), 50))
+                result = await page.evaluate(
+                    """async (ps) => {
+                        const q = new URLSearchParams({
+                            status: 'is_pubing,pubed,not_pubed',
+                            pn: '1',
+                            ps: String(ps),
+                            coop: '1',
+                            interactive: '1',
+                            client_type: '1',
+                        });
+                        const resp = await fetch(
+                            'https://member.bilibili.com/x/web/archives?'
+                            + q.toString(),
+                            {credentials: 'include'},
+                        );
+                        return await resp.json();
+                    }""",
+                    ps,
+                )
+                if not isinstance(result, dict) or result.get("code") != 0:
+                    logger.info(
+                        "[bilibili list_works] 接口返回异常: %s",
+                        str(result)[:200],
+                    )
+                    return []
+
+                from datetime import datetime
+
+                works = []
+                for item in result.get("data", {}).get("arc_audits") or []:
+                    arc = item.get("Archive") or {}
+                    stat = item.get("stat") or {}
+                    bvid = arc.get("bvid") or ""
+                    ts = arc.get("ptime") or arc.get("ctime") or 0
+                    try:
+                        publish_time = datetime.fromtimestamp(int(ts)).strftime(
+                            "%Y-%m-%d %H:%M"
+                        )
+                    except (ValueError, TypeError, OSError):
+                        publish_time = ""
+                    works.append({
+                        "work_id": bvid,
+                        "work_type": "video",
+                        "title": arc.get("title") or "",
+                        "publish_time": publish_time,
+                        "url": f"https://www.bilibili.com/video/{bvid}" if bvid else "",
+                        "views": stat.get("view"),
+                        "likes": stat.get("like"),
+                        "favorites": stat.get("favorite"),
+                        "comments": stat.get("reply"),
+                        "share": stat.get("share"),
+                        # 附带字段: 转码中/审核中的状态文案(契约外,排查用)
+                        "status": arc.get("state_desc") or "",
+                    })
+                logger.info(
+                    "[bilibili list_works] 抓到 %d 条作品 (count=%s)",
+                    len(works),
+                    (result.get("data", {}) or {}).get("page", {}).get("count"),
+                )
+                return works
+            except Exception as e:
+                logger.info(f"[bilibili list_works] 抓取失败: {e}")
+                return []
+            finally:
+                try:
+                    await page.close()
+                    await context.close()
+                except Exception:
+                    pass
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass

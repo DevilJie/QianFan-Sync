@@ -3993,3 +3993,180 @@ class ToutiaoPlatform(BasePlatform):
         if p.exists():
             return str(p)
         raise RuntimeError(f"[文章][头条] 无法解析正文图片 src: {src}")
+
+    # ------------------------------------------------------------------
+    # list_works — 内容管理页作品列表(作品回链 + 统计同步数据源)
+    # ------------------------------------------------------------------
+
+    # 内容管理页(登录态宿主页面, 页内 fetch 以此为上下文直调列表接口)
+    _MANAGE_URL = "https://mp.toutiao.com/profile_v4/manage/content/all"
+    # 内容列表接口(2026-11 踩点实证): status=2 已发布, type=0 全部体裁,
+    # 服务端 page_size 上限实测 30; 体裁在 article_attr.article_type 区分
+    _LIST_API_PATH = "/mp/agw/creator_center/list/v2"
+    # 公开作品页模板(实测 item/<gid> 与 i<gid> 均 301 到这两个规范模板)
+    _PUBLIC_URL_TPL = {
+        "article": "https://www.toutiao.com/article/{gid}/",
+        "video": "https://www.toutiao.com/video/{gid}/",
+    }
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list:
+        """抓取创作中心「内容管理」作品列表(按发布时间倒序), 供回链与统计同步。
+
+        work_type 路由: 'article' → article_type=article(文章);
+        'video' → article_type=video(西瓜/头条视频, 经 xigua/upload-video 发布)。
+        小视频(shortvideo)/微头条(weitoutiao)等其它体裁不归入这两类, 跳过;
+        'image' 图集无独立列表 → 返回 []。
+        任何异常(含 cookie 失效)只记日志并返回 [], 不抛出。
+
+        数据来源: 页内 fetch 直调 /mp/agw/creator_center/list/v2(仿
+        _fetch_article_draft_list 的 _fetch_platform_json 模式), 接口已带
+        need_stat=true 统计(展现/播放(阅读)/点赞/评论), 无需再解析 DOM。
+        """
+        if work_type not in ("video", "article"):
+            return []
+        # 接口体裁码 → 契约 work_type
+        want_article_type = "video" if work_type == "video" else "article"
+
+        def _to_int(v):
+            """统计字段安全转 int(接口可能给数字或字符串), 失败返回 None。"""
+            try:
+                return int(str(v).replace(",", "").strip())
+            except (ValueError, TypeError):
+                return None
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                try:
+                    await page.goto(
+                        self._MANAGE_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+                # cookie 失效: 被跳出 mp.toutiao.com(登录页) → 返回 []
+                if "mp.toutiao.com" not in (page.url or ""):
+                    logger.info(
+                        "[头条作品列表] cookie 失效(跳转 %s)", page.url
+                    )
+                    return []
+
+                # 页内 fetch 直调列表接口: type=0 混排全部体裁, 按文章属性
+                # 过滤; cursor 翻页 + gid 去重(实测相邻页有重叠), 最多 6 页
+                raw = await page.evaluate(
+                    """async (args) => {
+                        const [path, wantType, limit] = args;
+                        const items = [];
+                        const seen = {};
+                        let cursor = '';
+                        for (let pageNo = 0; pageNo < 6; pageNo++) {
+                            const qs = `?status=2&type=0&page_size=30`
+                                + `&need_stat=true&wenda_type=1&app_id=1231`
+                                + (cursor ? `&cursor=${cursor}` : '')
+                                + `&_=${Date.now()}`;
+                            let data;
+                            try {
+                                const resp = await fetch(path + qs, {
+                                    credentials: 'include',
+                                });
+                                if (!resp.ok) return {error: `http ${resp.status}`};
+                                data = await resp.json();
+                            } catch (e) {
+                                return {error: String(e)};
+                            }
+                            if (!data || data.code !== 0) {
+                                return {error: `code ${data && data.code} `
+                                    + `${(data && data.message) || ''}`};
+                            }
+                            const list = data.contents || [];
+                            let fresh = 0;
+                            for (const it of list) {
+                                const aa = it.article_attr || {};
+                                const gid = String(aa.gid || aa.item_id || '');
+                                if (!gid || seen[gid]) continue;
+                                seen[gid] = 1;
+                                fresh++;
+                                if (aa.article_type === wantType) {
+                                    items.push(it);
+                                }
+                            }
+                            cursor = String(data.end_cursor || '');
+                            if (!data.has_more || !fresh || !cursor
+                                || items.length >= limit) {
+                                break;
+                            }
+                        }
+                        return {items};
+                    }""",
+                    [
+                        self._LIST_API_PATH,
+                        want_article_type,
+                        max(int(limit or 20), 1),
+                    ],
+                )
+                if not isinstance(raw, dict) or raw.get("error"):
+                    logger.info(
+                        "[头条作品列表] 接口返回异常: %s", raw.get("error")
+                        if isinstance(raw, dict) else raw
+                    )
+                    return []
+
+                # 字段映射(踩点实证):
+                #   article_attr: gid/item_id=作品ID, title=标题,
+                #     create_time=发布时间(unix 秒), article_type=体裁,
+                #     status=2 已发布
+                #   article_stat: go_detail_count=阅读, play_count=播放,
+                #     digg_count=点赞, repin_count=收藏, comment_count=评论
+                #     (接口无转发数字, share 恒为 None)
+                works = []
+                for it in raw.get("items") or []:
+                    aa = it.get("article_attr") or {}
+                    st = it.get("article_stat") or {}
+                    gid = str(aa.get("gid") or aa.get("item_id") or "")
+                    ts = _to_int(aa.get("create_time"))
+                    works.append({
+                        "work_id": gid,
+                        "work_type": work_type,
+                        "title": str(aa.get("title")
+                                     or aa.get("rich_title") or "").strip(),
+                        "publish_time": (
+                            time.strftime(
+                                "%Y-%m-%d %H:%M:%S", time.localtime(ts)
+                            ) if ts else ""
+                        ),
+                        "url": (
+                            self._PUBLIC_URL_TPL[work_type].format(gid=gid)
+                            if gid else ""
+                        ),
+                        # views: 文章取阅读量, 视频取播放量
+                        "views": _to_int(
+                            st.get("go_detail_count")
+                            if work_type == "article"
+                            else st.get("play_count")
+                        ),
+                        "likes": _to_int(st.get("digg_count")),
+                        "favorites": _to_int(st.get("repin_count")),
+                        "comments": _to_int(st.get("comment_count")),
+                        "share": None,
+                    })
+                    if len(works) >= limit:
+                        break
+                logger.info(
+                    "[头条作品列表] work_type=%s 抓到 %d 条", work_type, len(works)
+                )
+                return works
+            finally:
+                await context.close()
+        except Exception as exc:
+            logger.warning("[头条作品列表] list_works 失败: %s", exc)
+            return []
+        finally:
+            await self.close_browser(browser, is_close_by_code=True)

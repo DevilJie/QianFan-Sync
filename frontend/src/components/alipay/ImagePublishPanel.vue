@@ -173,7 +173,8 @@ function onMusicImgError(e) {
 defineExpose(publicApi)
 </script>
 
-<style scoped>
+<style scoped lang="scss">
+@use '@/styles/variables.scss' as *;
 .alipay-image-publish-panel {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));

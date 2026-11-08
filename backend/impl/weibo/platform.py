@@ -4354,3 +4354,253 @@ class WeiboPlatform(BasePlatform):
                 return
             await asyncio.sleep(2)
         raise RuntimeError("[文章][微博] 身份验证后未能重新点击发布按钮")
+
+    # ==================================================================
+    # List works (作品列表抓取)
+    # ==================================================================
+
+    @staticmethod
+    def _wb_parse_count(val):
+        """把 '1.2万'/'852'/'1.3亿' 解析为 int, 解析不了返回 None。"""
+        if isinstance(val, (int, float)):
+            return int(val)
+        s = str(val or "").strip().replace(",", "").replace(" ", "")
+        if not s or not re.search(r"\d", s):
+            return None
+        try:
+            if s.endswith("亿"):
+                return int(float(s[:-1]) * 100000000)
+            if s.endswith("万"):
+                return int(float(s[:-1]) * 10000)
+            return int(float(s))
+        except (ValueError, TypeError):
+            return None
+
+    @classmethod
+    def _wb_num_from_display(cls, number_display, dtype):
+        """从 number_display 数组按 type 取数量(解析后), 没有则 None。"""
+        for it in number_display or []:
+            if isinstance(it, dict) and it.get("type") == dtype:
+                return cls._wb_parse_count(it.get("number"))
+        return None
+
+    @classmethod
+    def _wb_mblog_to_work(cls, item, uid):
+        """单条 mblog JSON → 契约 dict。非视频稿件返回 None。"""
+        if not isinstance(item, dict):
+            return None
+        work_id = item.get("mblogid") or str(item.get("id") or "")
+        if not work_id:
+            return None
+        page_info = item.get("page_info") or {}
+        is_video = (
+            page_info.get("type") == "video"
+            or bool(page_info.get("media_info"))
+            or page_info.get("object_type") == "video"
+        )
+        if not is_video:
+            return None
+
+        # 标题: 优先视频标题, 兜底正文去 HTML 标签
+        title = (page_info.get("title") or "").strip()
+        if not title:
+            text = re.sub(r"<[^>]+>", "", item.get("text") or "")
+            title = re.sub(r"\s+", " ", text).strip()[:80]
+
+        # 发布时间: ajax 返回 "Wed Oct 26 21:00:00 +0800 2026", 转为可读文本
+        created_at = item.get("created_at") or ""
+        publish_time = created_at
+        try:
+            publish_time = datetime.strptime(
+                created_at, "%a %b %d %H:%M:%S %z %Y"
+            ).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            pass  # 格式不认识就原样保存
+
+        # 统计: 优先经典 int 字段, 兜底 number_display('x.x万' 文案)
+        views = item.get("page_info", {}).get("play_count")
+        views = (
+            cls._wb_parse_count(views)
+            if views is not None
+            else cls._wb_num_from_display(item.get("number_display"), "play_count")
+        )
+        likes = (
+            item.get("attitudes_count")
+            if isinstance(item.get("attitudes_count"), int)
+            else cls._wb_num_from_display(item.get("number_display"), "like_count")
+        )
+        comments = (
+            item.get("comments_count")
+            if isinstance(item.get("comments_count"), int)
+            else cls._wb_num_from_display(item.get("number_display"), "comment_count")
+        )
+        share = (
+            item.get("reposts_count")
+            if isinstance(item.get("reposts_count"), int)
+            else cls._wb_num_from_display(item.get("number_display"), "repeat_count")
+        )
+
+        return {
+            "work_id": work_id,
+            "work_type": "video",
+            "title": title,
+            "publish_time": publish_time,
+            "url": f"https://weibo.com/{uid}/{work_id}",
+            "views": views,
+            "likes": likes,
+            "favorites": None,  # 微博无收藏计数(转发/评论/赞已有)
+            "comments": comments,
+            "share": share,
+        }
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取个人主页视频 tab 的视频作品列表（按发布时间倒序）。
+
+        实现说明（2026-11 踩点）：
+        - 微博视频发布不导航，无创作中心管理页；视频列表走个人主页
+          视频 tab（weibo.com/u/<uid>?tab=video）。
+        - 该 tab 的数据由页内 /ajax/ JSON 接口下发（mymblog 系），DOM 是
+          hash class 且混排复杂，因此采用「响应拦截」——与本项目文章发表
+          响应拦截(_safe_json L2545)同款模式：捕获页面自己请求的 JSON，
+          从中解析 mblog 对象（mblogid/text/created_at/attitudes_count/
+          comments_count/reposts_count/number_display）。
+        - 拦截不到时兜底页内 fetch mymblog(feature=2 视频筛选)。
+        - 登录态判定：顶部导航 .woo-tab-nav 头像链接(与 login L119 同款)。
+          cookie 失效(被甩到 newlogin) → log + return []。
+        - ⚠️ 当前账号 YI32863 的 cookie 服务端会话已失效(retcode=6102)，
+          本实现尚无登录态实测样例，待重新登录后需跑一次验证。
+        """
+        if work_type != "video":
+            return []
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+
+            # 1. 首页 + 轮询登录态标志(最长 15s; SSO 跳转需要几秒)
+            await page.goto(
+                "https://weibo.com/", wait_until="domcontentloaded", timeout=30000
+            )
+            logged_in = False
+            for _ in range(30):
+                await asyncio.sleep(0.5)
+                try:
+                    if await page.locator(
+                        '.woo-tab-nav a[href^="/u/"] img[src*="sinaimg.cn"]'
+                    ).count() > 0:
+                        logged_in = True
+                        break
+                except Exception:
+                    pass
+            if not logged_in:
+                logger.info(
+                    "[weibo list_works] cookie 失效(15s 内未出现登录态, url=%s)",
+                    page.url,
+                )
+                return []
+
+            # 2. 取 uid
+            uid = await page.evaluate(
+                """() => {
+                    const a = document.querySelector('.woo-tab-nav a[href^="/u/"]');
+                    if (!a) return '';
+                    const m = (a.getAttribute('href') || '').match(/\\/u\\/(\\d+)/);
+                    return m ? m[1] : '';
+                }"""
+            )
+            if not uid:
+                logger.info("[weibo list_works] 已登录但未取到 uid")
+                return []
+
+            # 3. 响应拦截: 捕获个人主页 /ajax/ JSON(视频 tab 的列表接口)
+            captured = []
+
+            async def _capture(resp):
+                if "/ajax/" not in resp.url:
+                    return
+                try:
+                    if "json" not in (resp.headers.get("content-type") or ""):
+                        return
+                    body = await resp.json()
+                except Exception:
+                    return
+                if isinstance(body, dict) and body.get("ok") == 1:
+                    captured.append(body)
+
+            def on_response(resp):
+                asyncio.ensure_future(_capture(resp))
+
+            page.on("response", on_response)
+
+            for tab_url in (
+                f"https://weibo.com/u/{uid}?tab=video",
+                f"https://weibo.com/u/{uid}?tabtype=video",
+            ):
+                try:
+                    await page.goto(
+                        tab_url, wait_until="domcontentloaded", timeout=30000
+                    )
+                except Exception as exc:
+                    logger.info("[weibo list_works] goto %s 失败: %s", tab_url, exc)
+                    continue
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+                if captured:
+                    break
+
+            # 4. 兜底: 页内 fetch mymblog(feature=2 = 视频) —— 拦截空时才调
+            if not captured:
+                body = await page.evaluate(
+                    """async (uid) => {
+                        try {
+                            const resp = await fetch(
+                                '/ajax/statuses/mymblog?uid=' + uid
+                                + '&page=1&feature=2',
+                                {credentials: 'include'},
+                            );
+                            return await resp.json();
+                        } catch (e) {
+                            return {ok: 0, err: String(e)};
+                        }
+                    }""",
+                    uid,
+                )
+                if isinstance(body, dict) and body.get("ok") == 1:
+                    captured.append(body)
+
+            # 5. 从全部捕获 payload 解析 mblog → 契约 dict(去重)
+            works, seen = [], set()
+            for body in captured:
+                data = body.get("data") or {}
+                items = (
+                    data.get("statuses")
+                    or data.get("list")
+                    or []
+                )
+                for item in items:
+                    work = self._wb_mblog_to_work(item, uid)
+                    if work and work["work_id"] not in seen:
+                        seen.add(work["work_id"])
+                        works.append(work)
+            works = works[: max(1, min(int(limit or 20), 50))]
+            logger.info("[weibo list_works] 抓到 %d 条视频作品", len(works))
+            return works
+        except Exception as e:
+            logger.info(f"[weibo list_works] 抓取失败: {e}")
+            return []
+        finally:
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass

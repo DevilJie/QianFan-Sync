@@ -102,6 +102,12 @@ import { useChannelForm } from '@/composables/useChannelForm'
 const props = defineProps({
   accountId: { type: [Number, Object], default: null },
   disabled: { type: Boolean, default: false },
+  // 公共封面 stored_path(发布中心通用区, 与 publishFn extra.coverStoredPath
+  // 同源: ArticlePublish.publishCoverStoredPath)。百家号封面必填,
+  // 校验时需结合它与正文配图判断
+  sharedCover: { type: String, default: '' },
+  // 公共正文图片数量(正文配图可充当百家号封面)
+  bodyImageCount: { type: Number, default: 0 },
 })
 
 const emit = defineEmits(['config-changed', 'publish-result'])
@@ -163,6 +169,11 @@ const { form, hasAccountOverride, resetOverride, publicApi } = useChannelForm(
     // 标题/正文在公共区校验,面板覆盖默认校验
     validateFn: (accountId, merged) => {
       const errors = []
+      // 百家号「设置封面」平台必填: 公共封面与正文配图至少存在其一,
+      // 否则后端封面上传无可用图、发布必失败(2026-11-02 E2E)
+      if (!String(props.sharedCover || '').trim() && !(props.bodyImageCount > 0)) {
+        errors.push('百家号要求设置封面或正文配图')
+      }
       // 来源说明联动: 勾选后平台会出现「来源时间/来源地点」必填项
       if (merged.sourceNote) {
         if (!merged.sourceTime && !merged.sourceLocation) {

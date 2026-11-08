@@ -338,6 +338,39 @@ def migrate_database():
         except Exception as e:
             logger.warning(f'[migrate] fans/likes/follows → stats 数据迁移失败(可忽略): {e}')
 
+    # 作品回链与数据统计同步：publish_details 加作品 ID + 绑定退避标记
+    # work_id = 平台作品唯一 ID；bind_attempts/bind_exhausted = 绑定退避计数/耗尽标记
+    for col_sql in (
+        "ALTER TABLE publish_details ADD COLUMN work_id TEXT DEFAULT ''",
+        "ALTER TABLE publish_details ADD COLUMN bind_attempts INTEGER DEFAULT 0",
+        "ALTER TABLE publish_details ADD COLUMN bind_exhausted INTEGER DEFAULT 0",
+    ):
+        try:
+            cursor.execute(col_sql)
+            logger.info(f"已添加 publish_details.{col_sql.split('ADD COLUMN ')[1].split()[0]} 列")
+        except sqlite3.OperationalError:
+            pass  # 列已存在
+
+    # 作品数据统计快照表（每次同步 1 行，天然支持趋势回看）
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS publish_work_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        detail_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL DEFAULT '',
+        work_type TEXT NOT NULL DEFAULT '',
+        work_id TEXT DEFAULT '',
+        views INTEGER,
+        likes INTEGER,
+        favorites INTEGER,
+        comments INTEGER,
+        share INTEGER,
+        raw TEXT DEFAULT '{}',
+        captured_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pws_detail ON publish_work_stats(detail_id, captured_at DESC)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_pws_batch ON publish_work_stats(batch_id)")
+
     conn.commit()
     conn.close()
 

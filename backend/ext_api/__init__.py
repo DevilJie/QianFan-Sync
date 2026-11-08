@@ -22,6 +22,7 @@ from ._personalized import compute_personalized
 from services.draft_merge import (
     merge_config, validate_draft_for_publish, build_platform_kwargs,
 )
+from services.work_stats_sync import get_sync_status, trigger_bind, trigger_sync
 
 ext_api = Blueprint('ext_api', __name__, url_prefix='/api/v2')
 
@@ -378,6 +379,40 @@ def queue_status():
 
 # ========== 发布历史 ==========
 
+def _get_latest_work_stats(detail_id):
+    """查 publish_work_stats 该明细最新一行快照 → stats dict。
+
+    无快照（未同步过 / 表尚不存在）时各字段为 null；
+    synced_at 为最新快照 captured_at 的北京时间。
+    """
+    stats = {"views": None, "likes": None, "favorites": None,
+             "comments": None, "share": None, "synced_at": None}
+    if not detail_id:
+        return stats
+    try:
+        conn = _db_conn()
+        row = conn.execute(
+            "SELECT views, likes, favorites, comments, share, captured_at"
+            " FROM publish_work_stats WHERE detail_id = ?"
+            " ORDER BY id DESC LIMIT 1",
+            (detail_id,),
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return stats
+    if not row:
+        return stats
+    stats.update({
+        "views": row['views'],
+        "likes": row['likes'],
+        "favorites": row['favorites'],
+        "comments": row['comments'],
+        "share": row['share'],
+        "synced_at": _to_beijing_time(row['captured_at']),
+    })
+    return stats
+
+
 def _normalize_detail_row(d):
     """把 publish_details 1 行 dict 规范化：JSON 反序列化 account_configs + 计算 duration"""
     try:
@@ -411,6 +446,8 @@ def _normalize_detail_row(d):
     elif plat in _PLATFORM_KEY_TO_NAME:
         # 是拼音 key,转成中文名
         d['platform'] = _PLATFORM_KEY_TO_NAME[plat]
+    # 注入作品数据统计快照（最新一行；无快照时各字段 null）
+    d['stats'] = _get_latest_work_stats(d.get('id'))
     return d
 
 
@@ -436,6 +473,15 @@ def _serialize_batch_with_items(b, items):
             or _resolve_cover_from_path(first_cfg.get('thumbnail_path', ''))
             or _resolve_cover_from_path(first_cfg.get('coverStoredPath', ''))
         )
+    # 批次级聚合统计：各 detail 最新快照同指标分别求和（全 null 则省略该键）。
+    # detail 的 stats 已由 _normalize_detail_row 注入，这里直接累加即可。
+    aggregate_stats = {}
+    for d_item in items:
+        st = d_item.get('stats') or {}
+        for key in ('views', 'likes', 'favorites', 'comments', 'share'):
+            v = st.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                aggregate_stats[key] = aggregate_stats.get(key, 0) + v
     return {
         'id': b['id'],
         'type': b['type'],
@@ -457,6 +503,7 @@ def _serialize_batch_with_items(b, items):
         'created_at': _to_beijing_time(b.get('created_at')),
         'started_at': _to_beijing_time(b.get('started_at')),
         'finished_at': _to_beijing_time(b.get('finished_at')),
+        'aggregate_stats': aggregate_stats,
         'items': items,
     }
 
@@ -662,6 +709,53 @@ def delete_history_batch(batch_id):
         conn.close()
 
 
+# ========== 作品回链与数据统计同步 ==========
+
+@ext_api.route('/history/<batch_id>/bind-works', methods=['POST'])
+def bind_batch_works(batch_id):
+    """手动补绑：对该批次全部 success 明细立即执行一次绑定。
+
+    复用 services.work_stats_sync.trigger_bind：先清空退避计数
+    （bind_exhausted 复位），再按 §2.2 匹配规则立即重试，返回每个 detail 的结果。
+    Response 200: {"code": 200, "data": [{detail_id, batch_id, bound,
+                   publish_url, work_id, reason}, ...]}
+    Response 409: {"code": 409, "msg": "已有绑定/同步任务在进行中..."}
+    """
+    try:
+        results = trigger_bind(batch_id)
+        return jsonify({"code": 200, "data": results})
+    except RuntimeError as e:
+        return jsonify({"code": 409, "msg": str(e)}), 409
+    except Exception as e:
+        return jsonify({"code": 500, "msg": str(e)}), 500
+
+
+@ext_api.route('/works/sync', methods=['POST'])
+def works_sync():
+    """立即触发一轮统计同步（异步执行）。
+
+    Body: {"detail_ids": [str, ...]}（可选；缺省同步窗口期内全部明细）
+    Response 200: {"code": 200, "data": {"started": true}}
+    Response 400: detail_ids 不是数组
+    """
+    data = request.get_json(silent=True) or {}
+    detail_ids = data.get('detail_ids')
+    if detail_ids is not None and not isinstance(detail_ids, list):
+        return jsonify({"code": 400, "msg": "detail_ids 必须是数组"}), 400
+    started = trigger_sync(detail_ids)
+    return jsonify({"code": 200, "data": {"started": started}})
+
+
+@ext_api.route('/works/sync-status', methods=['GET'])
+def works_sync_status():
+    """统计同步运行状态（历史页/设置页展示用）。
+
+    Response 200: {"code": 200, "data": {running, last_synced_at,
+                   interval_minutes, enabled}}
+    """
+    return jsonify({"code": 200, "data": get_sync_status()})
+
+
 # ========== 统计数据 ==========
 
 @ext_api.route('/stats', methods=['GET'])
@@ -750,6 +844,11 @@ def get_settings():
             "accountCheckMode": "pre-publish",
             "batchTaskInterval": "0",
             "manualReview": "false",
+            # 作品数据统计同步（services/work_stats_sync.py）：
+            # 同步间隔分钟（0=关闭）/ 同步窗口天数 / 绑定窗口天数
+            "workStatsSyncInterval": "60",
+            "workStatsSyncWindowDays": "30",
+            "workStatsBindWindowDays": "2",
         }
         defaults.update(settings)
         # manualReview 归一化为小写字符串 'true'/'false'
@@ -767,7 +866,9 @@ def get_settings():
                 defaults[key] = defaults[key] in ('true', 'True', '1', True)
         # 转换数值类型
         for key in ['publishInterval', 'maxConcurrent', 'heartbeatInterval',
-                    'autoSaveInterval', 'batchTaskInterval']:
+                    'autoSaveInterval', 'batchTaskInterval',
+                    'workStatsSyncInterval', 'workStatsSyncWindowDays',
+                    'workStatsBindWindowDays']:
             if key in defaults:
                 try:
                     defaults[key] = int(defaults[key])

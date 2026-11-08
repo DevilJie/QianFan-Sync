@@ -44,6 +44,11 @@ class BasePlatform(ABC):
     #: string (e.g. pasted from browser DevTools).  Subclasses override.
     supports_cookie_import: bool = False
 
+    #: True if 视频发布支持「存草稿」—— 即 is_draft=True 时把作品存到该平台
+    #: 官方草稿箱而不是直接发布。仅已被 impl 实测支持的平台才置 True
+    #: (TaskQueue 据此拦截不支持的「存草稿」请求,防止误发布)。
+    supports_video_draft: bool = False
+
     #: The wildcard domain to attach imported cookies to, e.g. ``".baidu.com"``
     #: for Baijiahao (cookie issued by passport.baidu.com also applies to
     #: baijiahao.baidu.com).  Subclasses override; most platforms can simply
@@ -393,4 +398,33 @@ class BasePlatform(ABC):
         """Fetch account statistics (default: not supported)."""
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support statistics"
+        )
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取创作者中心「内容管理」页的作品列表（按发布时间倒序）。
+
+        Args:
+            work_type: 'video' | 'image' | 'article'（与 publish_batches.type 同义）。
+                同一平台不同类型的作品往往在不同的管理页/tab（如微博视频在主页
+                视频 tab、文章在 card.weibo.com），必须按类型路由；传空 = 平台
+                单一列表页通吃时才允许（如抖音视频+图集同页）。平台不支持该
+                类型 → 返回 []。
+
+        返回 dict 字段约定：
+          work_id      str   平台作品唯一 ID（页面拿不到就空串）
+          work_type    str   'video' | 'image' | 'article'（回填调用方）
+          title        str   作品标题
+          publish_time str   平台展示的发布时间文本（原样保存）
+          url          str   公开作品页 URL（平台无法提供时为空串，统计仍可同步）
+          views        int|None   播放/阅读量
+          likes        int|None   点赞/获赞
+          favorites    int|None   收藏
+          comments     int|None   评论
+          share        int|None   转发/分享
+        页面不可见/未过审/抓取失败 → 返回 []（不抛异常）。
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support listing works"
         )

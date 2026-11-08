@@ -20,6 +20,16 @@ import requests as _requests
 for _k in ('ALL_PROXY', 'all_proxy'):
     os.environ.pop(_k, None)
 
+# [FIX 2026-11-02] Windows 下 stdout/stderr 若为管道（打包桌面应用 / 重定向日志），
+# 编码回退到 GBK(cp936)，print 含 emoji 的标题/描述会抛 UnicodeEncodeError
+# 导致图集/微博发布接口 500。统一重配置为 UTF-8（非法字符 replace 不中断）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream is not None and hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass  # 个别环境（如 pythonw 的 None 流）不支持时忽略，不影响启动
+
 from flask import Flask, Response, g, jsonify, request, send_from_directory
 from flask_cors import CORS
 
@@ -72,6 +82,7 @@ logger.info(f"[Startup] SAU_PORT={os.environ.get('SAU_PORT')}, SAU_DATA_DIR={os.
 from impl.registry import get_platform
 from impl.settings import read_settings
 from services import publish_executor as _publish_exec
+from services.work_stats_sync import start_work_stats_sync
 
 app = Flask(__name__)
 CORS(app)
@@ -142,6 +153,10 @@ logger.info("[Startup] csdn_bp registered OK")
 from blueprints.vivo_bp import vivo_bp  # noqa: E402
 app.register_blueprint(vivo_bp)
 logger.info("[Startup] vivo_bp registered OK")
+
+from blueprints.kuaishou_bp import kuaishou_bp  # noqa: E402
+app.register_blueprint(kuaishou_bp)
+logger.info("[Startup] kuaishou_bp registered OK")
 
 from blueprints.xiaohongshu_bp import xiaohongshu_bp  # noqa: E402
 app.register_blueprint(xiaohongshu_bp)
@@ -1141,6 +1156,14 @@ def postVideo():
                 vivo_declaration=data.get('vivoDeclaration', ''),
                 vivo_privacy=data.get('vivoPrivacy', '公开'),
                 vivo_download_permission=data.get('vivoDownloadPermission', '允许'),
+                # 快手特有:作者服务(关联小程序)/添加地点/互动设置/查看权限
+                ks_author_service=data.get('ksAuthorService', ''),
+                ks_mini_app_link=data.get('ksMiniAppLink', ''),
+                ks_location_name=data.get('ksLocationName', ''),
+                ks_visibility=data.get('ksVisibility', ''),
+                ks_allow_same_frame=data.get('ksAllowSameFrame') if data.get('ksAllowSameFrame') is not None else True,
+                ks_allow_download=data.get('ksAllowDownload') if data.get('ksAllowDownload') is not None else True,
+                ks_nearby_show=data.get('ksNearbyShow') if data.get('ksNearbyShow') is not None else True,
                 # 微信公众号特有参数
                 is_original=data.get('isOriginal', False),
                 gzh_collection_name=data.get('gzhCollectionName', ''),
@@ -1728,6 +1751,13 @@ if __name__ == "__main__":
         start_repair_in_background()
     except Exception as _e:
         logger.warning("[Startup] 补全任务启动失败（不影响主服务）: %s", _e)
+
+    # 启动后台任务：作品回链绑定协调器（快速拍）+ 数据统计定时同步（同步拍）
+    # （设计 spec：docs/superpowers/specs/2026-11-01-work-link-and-stats-sync-design.md）
+    try:
+        start_work_stats_sync()
+    except Exception as _e:
+        logger.warning("[Startup] 作品数据同步任务启动失败（不影响主服务）: %s", _e)
 
     # 账号登录状态检查机制:如果设置为「启动时检测」,后台异步检测所有账号 cookie
     try:

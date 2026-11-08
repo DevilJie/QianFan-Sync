@@ -209,7 +209,13 @@
             </span>
           </div>
           <div class="card-stats">
-            <PublishStats compact />
+            <PublishStats
+              compact
+              :views="batch.aggregate_stats?.views ?? null"
+              :likes="batch.aggregate_stats?.likes ?? null"
+              :favorites="batch.aggregate_stats?.favorites ?? null"
+              :comments="batch.aggregate_stats?.comments ?? null"
+            />
           </div>
         </div>
 
@@ -222,6 +228,13 @@
               :icon="Close"
               @click.stop="cancelBatch(batch)"
             >取消发布</el-button>
+            <el-button
+              type="primary"
+              plain
+              :icon="Link"
+              :loading="bindingId === batch.id"
+              @click.stop="bindBatchWorksData(batch)"
+            >关联数据</el-button>
             <el-button
               type="danger"
               :icon="Delete"
@@ -252,8 +265,8 @@
 import { ref, computed, onMounted, onBeforeUnmount, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Clock, Picture, Refresh, Upload, CircleCheck, Calendar, Delete, Check, Select, Close, Timer } from '@element-plus/icons-vue'
-import { historyApi, statsApi, taskApi } from '@/api/v2'
+import { Clock, Picture, Refresh, Upload, CircleCheck, Calendar, Delete, Check, Select, Close, Timer, Link } from '@element-plus/icons-vue'
+import { historyApi, statsApi, taskApi, worksApi } from '@/api/v2'
 import { platformList, getPlatformByKey } from '@/config/platforms'
 import ChannelSummary from '@/components/ChannelSummary.vue'
 import PublishStats from '@/components/PublishStats.vue'
@@ -477,6 +490,41 @@ async function cancelBatch(batch) {
   }
   ElMessage.success(ok > 0 ? `已请求取消 ${ok}/${active.length} 个任务` : '取消失败')
   fetchHistory()
+}
+
+// ===== 一键关联作品数据(绑定平台作品 + 同步播放量等统计) =====
+const bindingId = ref(null)
+async function bindBatchWorksData(batch) {
+  const title = batch.title || '无标题'
+  try {
+    await ElMessageBox.confirm(
+      `将对「${title}」本批次全部发布成功的记录执行作品关联，并立即同步播放量等数据。继续吗？`,
+      '一键关联作品数据',
+      { confirmButtonText: '开始关联', cancelButtonText: '取消', type: 'info' },
+    )
+  } catch {
+    return
+  }
+  bindingId.value = batch.id
+  try {
+    // 绑定是后端同步执行(逐平台开浏览器抓作品列表,多账号可能耗时较长)
+    const resp = await worksApi.bindWorks(batch.id)
+    const results = resp?.data || []
+    const boundIds = results.filter((r) => r.bound).map((r) => r.detail_id)
+    if (boundIds.length === 0) {
+      const reasons = results.map((r) => r.reason).filter(Boolean)[0]
+      ElMessage.warning(reasons || '没有可关联的作品：未找到匹配的平台作品（刚发布的内容可能还在审核中，稍后再试）')
+      return
+    }
+    // 触发统计同步(后端异步执行),只同步本批次已关联的明细
+    await worksApi.sync(boundIds)
+    ElMessage.success(`已关联 ${boundIds.length} 条作品，统计同步已开始，稍后刷新查看播放量等数据`)
+    fetchHistorySilent()
+  } catch {
+    // 错误提示已由响应拦截器处理(如 409 已有绑定/同步任务进行中)
+  } finally {
+    bindingId.value = null
+  }
 }
 
 // ===== 单条删除 =====

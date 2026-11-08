@@ -12,7 +12,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import threading
+import time
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
 
@@ -51,6 +55,13 @@ _HOME_HOST = "creator.guanghe.taobao.com"
 
 # 发布成功后跳转的 URL 标识
 _PUBLISH_SUCCESS_URL_MARK = "/page/workspace/tb"
+
+# 工作台「内容管理」列表页（list_works 抓取入口）
+_GUANGHE_WORKSPACE_URL = "https://creator.guanghe.taobao.com/page/workspace/tb"
+
+# mtop h5 网关列表接口（工作台页面自己请求的同一接口，2026-11 踩点实证）
+_GUANGHE_MTOP_LIST_API = "mtop.taobao.gcm.content.admin.list"
+_GUANGHE_MTOP_APP_KEY = "12574478"
 
 # 视频发布限制（详见 zfb.md）
 _GUANGHE_MAX_TITLE_LEN = 30       # 标题 ≤30 字
@@ -1761,6 +1772,189 @@ class TaobaoGuanghePlatform(BasePlatform):
         except Exception as exc:
             logger.info(f"[发布] 点击发布失败: {exc}")
             return False
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取光合工作台「内容管理」的作品列表（按发布时间倒序）。
+
+        实现（2026-11 踩点实证）：光合发布成功后停在发布页，作品链接只在
+        工作台 ``/page/workspace/tb`` 的「内容管理」列表里。该页面自己会
+        请求 mtop h5 网关接口 ``mtop.taobao.gcm.content.admin.list``
+        （GET + JSONP，业务参数放 query 的 data 字段），响应含：
+          baseInfo.id/title/type/publishTime + rawDetailUrl(逛逛公开链接)
+          + interactiveInfo.pvCount/likeCount/commentCount/collectCount。
+        这里用页内 JSONP 直调同一接口：sign 按 mtop 公开算法
+        ``md5(token & t & appKey & data)`` 计算，token 现场读页内
+        ``_m_h5_tk`` cookie（storage_state 文件里的是旧的，已过期），
+        登录态由 .taobao.com 域 cookie 自动携带，不绕任何签名/风控。
+
+        work_type 仅支持 'video'（光合/逛逛只有视频内容）；其它 → []。
+        异常一律 log + return []，不影响调用方。
+        """
+        if work_type != "video":
+            return []
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+            try:
+                await page.goto(
+                    _GUANGHE_WORKSPACE_URL, wait_until="domcontentloaded", timeout=30000
+                )
+                await asyncio.sleep(3)
+                if "login.taobao.com" in (page.url or ""):
+                    logger.info("[taobao_guanghe list_works] cookie 失效(跳到登录页)")
+                    return []
+
+                # 页内读 mtop token（_m_h5_tk 值首个下划线前的 32 位 hex）
+                read_token_js = (
+                    "() => { const m = document.cookie"
+                    ".match(/(?:^|;\\s*)_m_h5_tk=([^;_]+)/);"
+                    " return m ? m[1] : ''; }"
+                )
+                # JSONP 注入 script 直调 mtop（与页面自身请求方式一致）
+                jsonp_js = """async (args) => {
+                    const [api, appKey, t, sign, dataStr] = args;
+                    return await new Promise((resolve) => {
+                        const cb = 'mtopjsonp' + Math.floor(Math.random() * 1e8);
+                        const url = 'https://h5api.m.taobao.com/h5/' + api + '/1.0/'
+                            + '?jsv=2.6.1&appKey=' + appKey + '&t=' + t
+                            + '&sign=' + sign + '&api=' + api + '&v=1.0'
+                            + '&dataType=originaljsonp&syncCookieMode=true'
+                            + '&preventFallback=true&type=originaljsonp'
+                            + '&callback=' + cb
+                            + '&data=' + encodeURIComponent(dataStr);
+                        let done = false;
+                        const timer = setTimeout(() => {
+                            if (!done) { done = true; resolve({error: 'jsonp timeout'}); }
+                        }, 15000);
+                        window[cb] = (d) => {
+                            if (!done) { done = true; clearTimeout(timer); resolve(d); }
+                            try { delete window[cb]; } catch (e) { window[cb] = undefined; }
+                        };
+                        const s = document.createElement('script');
+                        s.src = url;
+                        s.onerror = () => {
+                            if (!done) { done = true; clearTimeout(timer);
+                                resolve({error: 'script load failed'}); }
+                        };
+                        document.head.appendChild(s);
+                    });
+                }"""
+
+                page_size = max(1, min(int(limit or 20), 50))
+                works: list[dict] = []
+                page_no = 1
+                token_retry = 0
+                token = await page.evaluate(read_token_js)
+                while len(works) < int(limit or 20):
+                    t = str(int(time.time() * 1000))
+                    # 业务参数与页面原始请求一致（condition 为字符串化 JSON）
+                    data_str = json.dumps({
+                        "condition": json.dumps({"showContentDiagnosis": True}),
+                        "source": "guanghe",
+                        "mode": 0,
+                        "scene": "workList",
+                        "agentType": "",
+                        "pageSize": page_size,
+                        "pageNo": page_no,
+                        "channelLocation": "creator_contentmanagement",
+                        "promoteSourceUrl": _GUANGHE_WORKSPACE_URL,
+                        "version": 2,
+                    }, separators=(",", ":"))
+                    sign = hashlib.md5(
+                        f"{token}&{t}&{_GUANGHE_MTOP_APP_KEY}&{data_str}".encode()
+                    ).hexdigest()
+                    resp = await page.evaluate(jsonp_js, [
+                        _GUANGHE_MTOP_LIST_API, _GUANGHE_MTOP_APP_KEY,
+                        t, sign, data_str,
+                    ])
+                    if not isinstance(resp, dict):
+                        logger.info(
+                            "[taobao_guanghe list_works] 接口响应异常: %s", str(resp)[:200]
+                        )
+                        break
+                    ret_text = ";".join(str(r) for r in (resp.get("ret") or []))
+                    if "TOKEN_EXOIRED" in ret_text or "TOKEN_EMPTY" in ret_text:
+                        # mtop 已 Set-Cookie 下发新 token，重读后重试本页
+                        token_retry += 1
+                        if token_retry > 2 or not (token := await page.evaluate(read_token_js)):
+                            logger.info(
+                                "[taobao_guanghe list_works] mtop token 重试失败: %s",
+                                ret_text[:120],
+                            )
+                            break
+                        continue
+
+                    model = (resp.get("data") or {}).get("model") or {}
+                    items = model.get("data") or []
+                    for item in items:
+                        base = item.get("baseInfo") or {}
+                        if base.get("type") != "video":
+                            continue
+                        inter = item.get("interactiveInfo") or {}
+                        audit = item.get("auditInfo") or {}
+                        work_id = str(base.get("id") or "")
+                        ts = base.get("publishTime") or base.get("createTime") or 0
+                        try:
+                            publish_time = datetime.fromtimestamp(
+                                int(ts) / 1000
+                            ).strftime("%Y-%m-%d %H:%M")
+                        except (ValueError, TypeError, OSError):
+                            publish_time = ""
+                        works.append({
+                            "work_id": work_id,
+                            "work_type": "video",
+                            "title": str(base.get("title") or "").strip(),
+                            "publish_time": publish_time,
+                            # 逛逛公开作品页链接（接口直接给，无需另拼）
+                            "url": str(base.get("rawDetailUrl") or ""),
+                            "views": inter.get("pvCount"),
+                            "likes": inter.get("likeCount"),
+                            "favorites": inter.get("collectCount"),
+                            "comments": inter.get("commentCount"),
+                            "share": None,  # 接口无转发数字段
+                            # 附带字段: 审核状态(契约外,排查用)
+                            "status": (
+                                "refused" if audit.get("status") == -1
+                                else ("online" if base.get("online") else "processing")
+                            ),
+                        })
+
+                    total = int(model.get("totalCount") or 0)
+                    page_count = int(model.get("pageCount") or 1)
+                    if not items or page_no >= page_count or len(works) >= total:
+                        break
+                    page_no += 1
+
+                logger.info(
+                    "[taobao_guanghe list_works] 抓到 %d 条作品 (totalCount=%s)",
+                    len(works), model.get("totalCount") if works else "-",
+                )
+                return works
+            except Exception as e:
+                logger.info(f"[taobao_guanghe list_works] 抓取失败: {e}")
+                return []
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.info(f"[taobao_guanghe list_works] 浏览器打开失败: {e}")
+            return []
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
     async def open_creator_center(self, cookie_file: str) -> None:
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))

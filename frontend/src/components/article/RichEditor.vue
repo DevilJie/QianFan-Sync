@@ -206,15 +206,18 @@ defineOptions({ inheritAttrs: false })
 </script>
 
 <style scoped lang="scss">
+@use '@/styles/variables.scss' as *;
+
+// 全部使用主题令牌：暗色模式下编辑器随主题（不再是刺眼的白底）
 .rich-editor {
-  border: 1px solid #dcdfe6;
+  border: 1px solid $border;
   border-radius: 8px;
   overflow: hidden;
-  background: #fff;
+  background: $bg-elevated;
   transition: border-color 0.2s;
 
   &:focus-within {
-    border-color: #07C160;
+    border-color: #07C160;  // 微信品牌绿，双主题通用
   }
 
   &.is-disabled {
@@ -229,8 +232,8 @@ defineOptions({ inheritAttrs: false })
   flex-wrap: wrap;
   gap: 2px;
   padding: 6px 8px;
-  border-bottom: 1px solid #ebeef5;
-  background: #f9fafc;
+  border-bottom: 1px solid $border-light;
+  background: rgba($overlay-rgb, 0.03);
 }
 
 .re-group {
@@ -240,7 +243,7 @@ defineOptions({ inheritAttrs: false })
   padding: 0 6px;
 
   & + .re-group {
-    border-left: 1px solid #e4e7ed;
+    border-left: 1px solid $border-light;
   }
 }
 
@@ -255,11 +258,11 @@ defineOptions({ inheritAttrs: false })
   border-radius: 4px;
   background: transparent;
   cursor: pointer;
-  color: #606266;
+  color: $text-secondary;
   font-size: 13px;
 
   &:hover {
-    background: #eef1f6;
+    background: rgba($overlay-rgb, 0.08);
     color: #07C160;
   }
 }
@@ -272,7 +275,7 @@ defineOptions({ inheritAttrs: false })
   padding: 14px 16px;
   font-size: 15px;
   line-height: 1.8;
-  color: #303133;
+  color: $text-primary;
   outline: none;
   word-break: break-word;
   overflow-y: auto;
@@ -286,9 +289,9 @@ defineOptions({ inheritAttrs: false })
   :deep(blockquote) {
     margin: 8px 0;
     padding: 6px 12px;
-    border-left: 3px solid #d0d6e0;
-    background: #f7f8fa;
-    color: #606266;
+    border-left: 3px solid $border-active;
+    background: rgba($overlay-rgb, 0.04);
+    color: $text-secondary;
   }
 
   :deep(h2), :deep(h3) {
@@ -302,7 +305,7 @@ defineOptions({ inheritAttrs: false })
   &:empty::before,
   &:has(> :only-child:is(br))::before {
     content: attr(data-placeholder);
-    color: #c0c4cc;
+    color: $text-placeholder;
     pointer-events: none;
   }
 }

@@ -11,10 +11,10 @@
       @visible-change="handleVisibleChange"
       style="width: 100%"
     >
-      <!-- ===== 顶部区:搜索框(仅非 autoLoad)+ loading(始终可用) ===== -->
+      <!-- ===== 顶部区:搜索框(默认跟随 autoLoad,可显式开启)+ loading(始终可用) ===== -->
       <template #header>
-        <!-- 搜索框:autoLoad 模式隐藏(全量加载无需搜索) -->
-        <div v-if="!isAutoLoad" class="rss-header">
+        <!-- 搜索框:默认 autoLoad 模式隐藏(全量加载无需搜索),show-search 可强制显示 -->
+        <div v-if="showSearchBox" class="rss-header">
           <div class="rss-search" :class="{ 'is-focused': searchFocused }">
             <el-icon class="rss-search-icon"><Search /></el-icon>
             <el-input
@@ -140,6 +140,15 @@ const props = defineProps({
     default: null
   },
   /**
+   * 是否显示顶部搜索框。默认跟随 autoLoad(autoLoad=true 隐藏)。
+   * 传 true 可在「打开即加载」的同时保留搜索框,
+   * 适用于推荐列表 + 关键词搜索同源分流的场景(如 B站参与话题)。
+   */
+  showSearch: {
+    type: Boolean,
+    default: null
+  },
+  /**
    * 空关键词行为(仅 searchMode=frontend 时生效):
    * load-all(默认) / clear / block
    */
@@ -169,6 +178,11 @@ const searched = ref(false)   // 是否已发起过搜索(用于空态文案区�
 // autoLoad:未显式传时,frontend 模式默认 true(打开即加载),backend 默认 false
 const isAutoLoad = computed(() =>
   props.autoLoad === null ? props.searchMode === 'frontend' : props.autoLoad
+)
+
+// 搜索框显隐:默认跟随 autoLoad(autoLoad=true 隐藏),showSearch 显式传值时优先
+const showSearchBox = computed(() =>
+  props.showSearch === null ? !isAutoLoad.value : props.showSearch
 )
 
 // 每个实例独立的 popper class,避免多实例共用同一 loading 遮罩
@@ -276,6 +290,9 @@ function handleClear() {
   searchKeyword.value = ''
   list.value = []
   searched.value = false
+  // 重置打开即加载标记:清空后下次展开重新加载初始列表
+  // (frontend+autoLoad=false 场景重新给推荐;autoLoad 场景修复清空后重开为空的旧问题)
+  autoLoaded.value = false
 }
 
 function handleChange(val) {
@@ -285,12 +302,20 @@ function handleChange(val) {
   emit('change', item ? { ...item, _searchKeyword: searchKeyword.value } : null)
 }
 
-// 下拉可见性变化:autoLoad 模式下,打开即加载全量(只加载一次,避免重复请求)
+// 下拉可见性变化:打开即加载(只加载一次,避免重复请求)
+// - autoLoad 模式(autoLoad=true 或 frontend 默认):打开即全量加载,搜索框隐藏
+// - frontend + 显式 autoLoad=false + load-all:打开即加载初始列表(推荐/全量),
+//   同时保留搜索框 —— 用于「默认给推荐、可再搜索」的混合场景(如 B 站参与话题)
 const autoLoaded = ref(false)
 function handleVisibleChange(visible) {
-  if (visible && isAutoLoad.value && !autoLoaded.value && !loading.value) {
-    autoLoaded.value = true
-    handleSearch()
+  if (visible && !autoLoaded.value && !loading.value) {
+    if (isAutoLoad.value) {
+      autoLoaded.value = true
+      handleSearch()
+    } else if (props.searchMode === 'frontend' && props.emptyBehavior === 'load-all') {
+      autoLoaded.value = true
+      handleSearch()
+    }
   }
 }
 

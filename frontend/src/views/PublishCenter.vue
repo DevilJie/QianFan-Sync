@@ -155,6 +155,12 @@
             <span>由于小红书反检测机制比较恶心，如果出现被警告的情况！请立即停止使用小红书渠道！</span>
           </div>
 
+          <!-- 渠道说明(note)：平台元数据配置, 当前仅百家号配了视频标题说明 -->
+          <div v-if="currentPlatformConfig?.note" class="platform-note">
+            <el-icon><InfoFilled /></el-icon>
+            <span>{{ currentPlatformConfig.note }}</span>
+          </div>
+
           <div class="platform-title-desc">
             <div class="setting-card" :style="{ borderColor: currentPlatformConfig.color + '26', background: currentPlatformConfig.color + '0a' }">
               <div class="setting-label" :style="{ color: currentPlatformConfig.color }">标题</div>
@@ -475,9 +481,10 @@
                   :fetcher="fetchBiliTopics"
                   :field-map="{ label: 'name', desc: 'activityText' }"
                   search-mode="frontend"
+                  :auto-load="false"
                   empty-behavior="load-all"
                   placeholder="从 B 站推荐话题中选择"
-                  search-placeholder="输入话题名称搜索"
+                  search-placeholder="输入话题名称,按回车搜索全站话题"
                   @change="handleBiliTopicChange"
                 />
               </div>
@@ -514,17 +521,19 @@
               </div>
               <div class="setting-card" :style="{ borderColor: currentPlatformConfig.color + '26', background: currentPlatformConfig.color + '0a' }">
                 <div class="setting-label" :style="{ color: currentPlatformConfig.color }">互动设置</div>
-                <div class="tag-option-row">
-                  <el-switch v-model="form.biliCloseDanmaku" size="small" />
-                  <span class="tag-option-label">关闭弹幕</span>
-                </div>
-                <div class="tag-option-row">
-                  <el-switch v-model="form.biliCloseComment" size="small" />
-                  <span class="tag-option-label">关闭评论</span>
-                </div>
-                <div class="tag-option-row">
-                  <el-switch v-model="form.biliFeaturedComment" size="small" />
-                  <span class="tag-option-label">开启精选评论</span>
+                <div class="switch-inline-row">
+                  <div class="tag-option-row">
+                    <el-switch v-model="form.biliCloseDanmaku" size="small" />
+                    <span class="tag-option-label">关闭弹幕</span>
+                  </div>
+                  <div class="tag-option-row">
+                    <el-switch v-model="form.biliCloseComment" size="small" />
+                    <span class="tag-option-label">关闭评论</span>
+                  </div>
+                  <div class="tag-option-row">
+                    <el-switch v-model="form.biliFeaturedComment" size="small" />
+                    <span class="tag-option-label">开启精选评论</span>
+                  </div>
                 </div>
               </div>
               <div class="setting-card" :style="{ borderColor: currentPlatformConfig.color + '26', background: currentPlatformConfig.color + '0a' }">
@@ -537,6 +546,79 @@
                   show-word-limit
                   placeholder="发布时同步一条粉丝动态,有趣的描述会增加上热门的机会(选填)"
                 />
+              </div>
+            </template>
+
+            <!-- 快手账号级字段(选中账号后才显示):作者服务/添加地点/互动设置/查看权限 -->
+            <template v-if="selectedPlatform === 'kuaishou' && selectedAccountId">
+              <div class="setting-card" :style="{ borderColor: currentPlatformConfig.color + '26', background: currentPlatformConfig.color + '0a' }">
+                <div class="setting-label" :style="{ color: currentPlatformConfig.color }">作者服务</div>
+                <el-select
+                  v-model="form.ksAuthorService"
+                  placeholder="选择服务类型"
+                  clearable
+                  class="cursor-pointer"
+                >
+                  <el-option label="关联小程序" value="关联小程序" />
+                </el-select>
+                <el-input
+                  v-if="form.ksAuthorService === '关联小程序'"
+                  v-model="form.ksMiniAppLink"
+                  placeholder="粘贴从快手APP复制的小程序页面链接"
+                />
+              </div>
+              <div class="setting-card" :style="{ borderColor: currentPlatformConfig.color + '26', background: currentPlatformConfig.color + '0a' }">
+                <div class="setting-label" :style="{ color: currentPlatformConfig.color }">添加地点</div>
+                <RemoteSearchSelect
+                  v-model="form.ksLocationName"
+                  :data="form.ksLocationData"
+                  :fetcher="fetchKuaishouLocations"
+                  :field-map="{ label: 'name', desc: 'address' }"
+                  search-mode="backend"
+                  empty-behavior="block"
+                  placeholder="输入地点关键词搜索(同城页展示)"
+                  search-placeholder="输入地点关键词,按回车搜索"
+                  @change="handleKsLocationChange"
+                />
+              </div>
+              <div class="setting-card" :style="{ borderColor: currentPlatformConfig.color + '26', background: currentPlatformConfig.color + '0a' }">
+                <div class="setting-label" :style="{ color: currentPlatformConfig.color }">互动设置</div>
+                <div class="switch-inline-row">
+                  <div class="tag-option-row">
+                    <el-switch v-model="form.ksAllowSameFrame" size="small" />
+                    <span class="tag-option-label">允许别人跟我拍同框</span>
+                  </div>
+                  <div class="tag-option-row">
+                    <el-switch v-model="form.ksAllowDownload" size="small" />
+                    <span class="tag-option-label">允许下载此作品</span>
+                  </div>
+                  <div class="tag-option-row">
+                    <el-switch v-model="form.ksNearbyShow" size="small" />
+                    <span class="tag-option-label">作品展示在同城页</span>
+                  </div>
+                </div>
+              </div>
+              <div class="setting-card" :style="{ borderColor: currentPlatformConfig.color + '26', background: currentPlatformConfig.color + '0a' }">
+                <div class="setting-label" :style="{ color: currentPlatformConfig.color }">查看权限</div>
+                <div class="radio-row">
+                  <label
+                    v-for="opt in ksVisibilityOptions"
+                    :key="opt"
+                    class="radio-item cursor-pointer"
+                  >
+                    <input
+                      type="radio"
+                      :name="(selectedAccountId || selectedPlatform) + '-ksVisibility'"
+                      :value="opt"
+                      v-model="form.ksVisibility"
+                      class="cursor-pointer"
+                    />
+                    <span
+                      :class="['radio-text', { on: form.ksVisibility === opt }]"
+                      :style="form.ksVisibility === opt ? { borderColor: currentPlatformConfig.color, color: currentPlatformConfig.color } : {}"
+                    >{{ opt }}</span>
+                  </label>
+                </div>
               </div>
             </template>
 
@@ -1008,7 +1090,7 @@
 import { historyApi } from '@/api/v2'
 import { historyVideoSnapshot, limitTags } from '@/utils/publishPreferences'
 import { ref, reactive, computed, nextTick, watch, onMounted, onBeforeUnmount } from 'vue'
-import { Upload, Picture, VideoCameraFilled, Delete, Document, WarningFilled, MagicStick, Setting, Promotion, UserFilled, Close, Plus, Guide } from '@element-plus/icons-vue'
+import { Upload, Picture, VideoCameraFilled, Delete, Document, WarningFilled, InfoFilled, MagicStick, Setting, Promotion, UserFilled, Close, Plus, Guide } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useAccountStore } from '@/stores/account'
 import { useAppStore } from '@/stores/app'
@@ -1045,6 +1127,7 @@ import ChannelsDramaPicker from '@/components/ChannelsDramaPicker.vue'
 import { channelsDramaApi } from '@/api/channels_drama'
 import { xhsApi } from '@/api/xiaohongshu'
 import { biliApi } from '@/api/bilibili'
+import { ksApi } from '@/api/kuaishou'
 import { douyinImageApi } from '@/api/douyinImage'
 import { alipayApi } from '@/api/alipay'
 import { toutiaoApi } from '@/api/toutiao'
@@ -1380,6 +1463,16 @@ function mergeConfig(common, platformDefault, platformOv, accountOv) {
     jdNovel: accountOv?.jdNovel ?? platformOv?.jdNovel ?? platformDefault?.jdNovel ?? '',
     jdNovelData: accountOv?.jdNovelData ?? platformOv?.jdNovelData ?? platformDefault?.jdNovelData ?? null,
     jdDeclaration: accountOv?.jdDeclaration ?? platformOv?.jdDeclaration ?? platformDefault?.jdDeclaration ?? '',
+    // 快手特有:作者服务(关联小程序)/添加地点/互动设置/查看权限
+    ksAuthorService: accountOv?.ksAuthorService ?? platformOv?.ksAuthorService ?? platformDefault?.ksAuthorService ?? '',
+    ksMiniAppLink: accountOv?.ksMiniAppLink ?? platformOv?.ksMiniAppLink ?? platformDefault?.ksMiniAppLink ?? '',
+    ksLocationName: accountOv?.ksLocationName ?? platformOv?.ksLocationName ?? platformDefault?.ksLocationName ?? '',
+    ksLocationData: accountOv?.ksLocationData ?? platformOv?.ksLocationData ?? platformDefault?.ksLocationData ?? null,
+    ksVisibility: accountOv?.ksVisibility ?? platformOv?.ksVisibility ?? platformDefault?.ksVisibility ?? '所有人可见',
+    // 互动设置三项:快手页面默认全勾选,缺省(旧草稿未存过该键)视为 true
+    ksAllowSameFrame: accountOv?.ksAllowSameFrame ?? platformOv?.ksAllowSameFrame ?? platformDefault?.ksAllowSameFrame ?? true,
+    ksAllowDownload: accountOv?.ksAllowDownload ?? platformOv?.ksAllowDownload ?? platformDefault?.ksAllowDownload ?? true,
+    ksNearbyShow: accountOv?.ksNearbyShow ?? platformOv?.ksNearbyShow ?? platformDefault?.ksNearbyShow ?? true,
   }
 }
 
@@ -1435,7 +1528,7 @@ const landscapeCoverFrames = computed(() =>
 const DEFAULT_PLATFORM_CONFIGS = {
   douyin: { title: '', description: '', tags: [], aiContent: '', isOriginal: false, scheduleTime: '', activityId: [], hotspotId: '', hotspotData: null, selectedTag: null, tagType: '', tagValue: '', mixId: '', mixData: null },
   xiaohongshu: { title: '', description: '', aiContent: '', isOriginal: false, scheduleTime: '', tags: [], collectionId: '', collectionName: '', collectionData: null },
-  kuaishou: { title: '', description: '', aiContent: '', isOriginal: false, scheduleTime: '', tags: [] },
+  kuaishou: { title: '', description: '', aiContent: '', isOriginal: false, scheduleTime: '', tags: [], ksAuthorService: '', ksMiniAppLink: '', ksLocationName: '', ksLocationData: null, ksVisibility: '所有人可见', ksAllowSameFrame: true, ksAllowDownload: true, ksNearbyShow: true },
   bilibili: { title: '', description: '', zone: '', tags: [], creationDeclaration: '', biliRepostSource: '', biliKeepSystemTags: true, isOriginal: false, scheduleTime: '', biliCollectionName: '', biliCollectionData: null, biliTopicName: '', biliTopicData: null, biliVisibility: 'public', biliCloseDanmaku: false, biliCloseComment: false, biliFeaturedComment: false, biliFansDynamic: '' },
   channels: { title: '', description: '', isOriginal: false, scheduleTime: '', tags: [], channelsCollectionName: '', channelsCollectionData: null, channelsLocationName: '', channelsLocationData: null, channelsActivityName: '', channelsActivityData: null, channelsMarkTag: '无需标注', channelsShootDate: '', channelsShootRegion: [], channelsRepostSource: '', channelsDrama: [], channelsLinkType: '', channelsLinkArticleUrl: '', channelsRedEnvelopeUrl: '' },
   baijiahao: { title: '', description: '', isOriginal: false, scheduleTime: '', tags: [] },
@@ -2010,15 +2103,36 @@ async function fetchBiliCollections(keyword) {
   }
 }
 
-// B站参与话题 —— RemoteSearchSelect 数据源(前端过滤模式)
-// 数据源:后端登录 context 直连 B站话题接口,按当前标题相关性推荐
+// B站参与话题 —— RemoteSearchSelect 数据源(关键词分流)
+// 空关键词:后端直连 B站话题接口,按当前标题相关性推荐(下拉打开即展示);
+// 有关键词:调话题搜索接口,搜推荐列表之外的全量话题(2026-11 弹层同源接口)
 async function fetchBiliTopics(keyword) {
-  const resp = await biliApi.getTopics(selectedAccountId.value, form.title || '')
-  const all = resp.data?.list || []
-  const kw = keyword?.trim().toLowerCase()
-  return {
-    list: kw ? all.filter(t => t.name?.toLowerCase().includes(kw)) : all
+  const kw = keyword?.trim()
+  if (kw) {
+    const resp = await biliApi.searchTopics(selectedAccountId.value, kw)
+    return { list: resp.data?.list || [] }
   }
+  const resp = await biliApi.getTopics(selectedAccountId.value, form.title || '')
+  return { list: resp.data?.list || [] }
+}
+
+// ===== 快手特有:添加地点/查看权限 =====
+const ksVisibilityOptions = ['所有人可见', '好友可见', '仅自己可见']
+
+// 快手添加地点 —— RemoteSearchSelect 数据源(后端搜索模式)
+// 数据源:后端浏览器代发打开快手发布页→选地区→拦截 poi/search(单次 30-60s,
+// 后端有 5 分钟缓存);POI 城市限定为账号/IP 所在城市,与快手产品行为一致
+async function fetchKuaishouLocations(keyword) {
+  const kw = keyword?.trim()
+  if (!kw) return { list: [] }
+  const resp = await ksApi.searchPosition(selectedAccountId.value, kw)
+  return { list: resp.data?.position_list || [] }
+}
+
+// 快手地点选择回调:v-model 已把地点名绑到 form.ksLocationName,
+// 这里把完整对象(含 address)存进 ksLocationData 供回显与发布
+function handleKsLocationChange(poi) {
+  form.ksLocationData = (poi && poi.name) ? poi : null
 }
 
 // 抖音合集(mix)—— RemoteSearchSelect 数据源(前端过滤模式,空关键词清空)
@@ -3618,10 +3732,14 @@ function formatSize(bytes) {
     }
 
     .header-btn {
-      // el-button 默认 padding 8px 15px / font-size 14px / height 32px
-      // 想要更紧凑一点,小分辨率下自动缩
+      // 与主按钮统一高度(40px),消除「普通按钮矮一截」的参差感
+      height: 40px;
+      padding: 0 18px;
+      border-radius: 8px;
+      font-weight: 500;
       @media (max-width: 1280px) {
-        padding: 6px 12px !important;
+        height: 36px;
+        padding: 0 12px !important;
         font-size: 12px !important;
       }
     }
@@ -3633,7 +3751,7 @@ function formatSize(bytes) {
       box-shadow: 0 4px 20px rgba($brand-start, 0.35) !important;
       font-weight: 700;
       letter-spacing: 0.04em;
-      padding: 10px 24px !important;
+      padding: 0 24px !important;
 
       &:hover {
         box-shadow: 0 6px 28px rgba($brand-start, 0.5) !important;
@@ -3687,6 +3805,25 @@ function formatSize(bytes) {
 
   .el-icon {
     font-size: 20px;
+    flex-shrink: 0;
+  }
+}
+
+// 渠道说明(note)：中性提示条, 不用小红书警告的红/闪烁样式
+.platform-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  margin-bottom: 16px;
+  background: rgba(#3385ff, 0.08);
+  border: 1px solid rgba(#3385ff, 0.3);
+  border-radius: 8px;
+  color: #3385ff;
+  font-size: 13px;
+
+  .el-icon {
+    font-size: 16px;
     flex-shrink: 0;
   }
 }
@@ -4531,6 +4668,17 @@ html.dark .guanghe-add-card:hover {
   gap: 8px;
   margin-top: 10px;
   flex-wrap: wrap;
+}
+/* 开关组单行排列(B站/快手互动设置):排不下时自动换行,不再各占一行 */
+.switch-inline-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+
+  .tag-option-row {
+    margin-top: 0;
+  }
 }
 .tag-option-label {
   font-size: 13px;

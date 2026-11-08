@@ -147,6 +147,9 @@ def merge_config(common, platform_default, platform_ov, account_ov):
         'channelsRedEnvelopeUrl',
         'collectionId', 'collectionName', 'collectionData',
         'xhsSourceType', 'xhsShootLocation', 'xhsShootDate', 'xhsRepostSource',
+        # 快手特有:作者服务(关联小程序)/添加地点/查看权限
+        'ksAuthorService', 'ksMiniAppLink', 'ksLocationName', 'ksLocationData',
+        'ksVisibility',
     ]:
         platform_specific[field] = _first_truthy(
             account_ov.get(field), platform_ov.get(field), platform_default.get(field)
@@ -157,6 +160,17 @@ def merge_config(common, platform_default, platform_ov, account_ov):
         platform_specific[field] = _first_bool(
             account_ov.get(field), platform_ov.get(field), platform_default.get(field)
         )
+
+    # 快手互动设置三项(布尔):快手发布页默认全勾选,缺省(旧草稿未存过该键)
+    # 视为 True 保持页面默认,不能落入 _first_bool 的 False 兜底
+    for field in ('ksAllowSameFrame', 'ksAllowDownload', 'ksNearbyShow'):
+        first = next(
+            (v for v in (
+                account_ov.get(field), platform_ov.get(field), platform_default.get(field)
+            ) if v is not None),
+            None,
+        )
+        platform_specific[field] = True if first is None else bool(first)
 
     return {
         'title': title,
@@ -522,4 +536,12 @@ def build_platform_kwargs(merged, common, account):
         'channels_collection_name': merged.get('channelsCollectionName', '') or '',
         # 视频号位置(平台级,空=不显示位置)
         'channels_location_name': merged.get('channelsLocationName', '') or '',
+        # 快手特有:作者服务(关联小程序)/添加地点/互动设置/查看权限
+        'ks_author_service': merged.get('ksAuthorService', '') or '',
+        'ks_mini_app_link': merged.get('ksMiniAppLink', '') or '',
+        'ks_location_name': merged.get('ksLocationName', '') or '',
+        'ks_visibility': merged.get('ksVisibility', '') or '',
+        'ks_allow_same_frame': bool(merged.get('ksAllowSameFrame', True)),
+        'ks_allow_download': bool(merged.get('ksAllowDownload', True)),
+        'ks_nearby_show': bool(merged.get('ksNearbyShow', True)),
     }

@@ -12,4 +12,10 @@ export const biliApi = {
       `/api/bilibili/topics?account_id=${accountId}&title=${encodeURIComponent(title || '')}`
     )
   },
+  // 按关键词搜索 B 站话题(后端直连 /x/vupre/web/topic/search,弹层同源接口)
+  searchTopics(accountId, keyword = '') {
+    return http.get(
+      `/api/bilibili/topic-search?account_id=${accountId}&keyword=${encodeURIComponent(keyword || '')}`
+    )
+  },
 }

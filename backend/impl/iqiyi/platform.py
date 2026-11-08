@@ -22,6 +22,9 @@ logger = get_channel_logger("iqiyi")
 
 _LOGIN_URL = "https://creator.iqiyi.com/"
 _PUBLISH_URL = "https://creator.iqiyi.com/publish/video/wemedia"
+# 作品列表接口(2026-11 踩点): 创作者中心首页「最近作品」模块自发请求,
+# 纯 cookie 鉴权无签名, 页内 fetch + credentials 直调即可, 见 list_works
+_WORKS_LIST_API = "https://mp-api.iqiyi.com/video/api/1.0/upgc/mp/selfmedia/videos"
 
 # ---------------------------------------------------------------------------
 # Creation declaration mapping (radio values → human-readable labels)
@@ -532,6 +535,19 @@ class IqiyiPlatform(BasePlatform):
                 logger.info("[上传视频] 视频上传成功! 发布表单已就绪")
                 await asyncio.sleep(3)
 
+                # Pre-form screenshot（表单渲染就绪后, 仿 bilibili, 供 E2E 报告佐证）
+                try:
+                    log_dir = Path(BASE_DIR / "logs")
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    await page.screenshot(
+                        path=str(log_dir / "iqiyi_before_form.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] before_form 截图失败(不影响发布): %s", e
+                    )
+
                 # Step 3: Fill title
                 await self._fill_title(page, title or desc)
 
@@ -578,6 +594,20 @@ class IqiyiPlatform(BasePlatform):
 
                 # Step 10: Click publish / submit
                 publish_ok = await self._click_publish(page)
+
+                # After-submit screenshot（成功判定完成后、流程收尾前）
+                # 放在 _click_publish 返回之后, 不介入其内部"跳到管理页判失败"等判定逻辑
+                try:
+                    log_dir = Path(BASE_DIR / "logs")
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    await page.screenshot(
+                        path=str(log_dir / "iqiyi_after_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] after_submit 截图失败(不影响发布): %s", e
+                    )
 
                 # Save updated cookie state regardless
                 await context.storage_state(path=account_file)
@@ -1052,6 +1082,20 @@ class IqiyiPlatform(BasePlatform):
             ).first
 
             await publish_btn.wait_for(state="visible", timeout=10000)
+
+            # Pre-submit screenshot（全部字段填写完成、点击发布按钮之前, full_page 测试报告核心佐证）
+            try:
+                log_dir = Path(BASE_DIR / "logs")
+                log_dir.mkdir(parents=True, exist_ok=True)
+                await page.screenshot(
+                    path=str(log_dir / "iqiyi_before_submit.png"),
+                    full_page=True,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[发布] before_submit 截图失败(不影响发布): %s", e
+                )
+
             await publish_btn.click()
             logger.info("[发布] Publish button clicked, waiting for navigation")
 
@@ -1099,3 +1143,123 @@ class IqiyiPlatform(BasePlatform):
         except Exception as e:
             logger.warning("[发布] Publish click failed: %s", e)
             raise
+
+    # ------------------------------------------------------------------
+    # list_works — 作品列表抓取(作品链接 + 播放量等统计, 回链/统计同步用)
+    # ------------------------------------------------------------------
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list[dict]:
+        """抓取创作者中心的作品列表(按发布时间倒序)。
+
+        实现(2026-11 踩点, 参考 scratch/scout_iqiyi*.py): 创作者中心首页
+        「最近作品」模块自身会请求 ``mp-api.iqiyi.com/.../selfmedia/videos``,
+        该接口纯 cookie 鉴权、无签名参数, 且管理页 DOM 不含作品链接。
+        因此仿头条/腾讯视频做法: 加载登录态后 goto 创作者中心首页,
+        页内 fetch 直调同一接口(credentials 带登录态), Python 侧映射契约字段。
+
+        work_type 仅支持 'video'(爱奇艺号创作者中心只有视频); 其它类型 → []。
+        cookie 失效(跳登录页)或任何异常 → log + return [], 不抛出。
+        """
+        if work_type != "video":
+            return []
+
+        def _to_int(v):
+            # 接口数值字段可能缺失/为字符串, 空/非法 → None(契约: 没有则 null)
+            try:
+                if v is None or str(v).strip() == "":
+                    return None
+                return int(str(v).strip())
+            except (ValueError, TypeError):
+                return None
+
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                await page.goto(_LOGIN_URL, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+                # cookie 失效: 被跳转到登录页 → return []
+                current_url = page.url or ""
+                if "passport" in current_url or "login" in current_url:
+                    logger.info(
+                        "[爱奇艺作品列表] cookie 失效(跳转登录页 %s)", current_url
+                    )
+                    return []
+
+                # 页内 fetch 直调作品列表接口(与首页「最近作品」同一接口,
+                # publishStatusSet=0,1,2 覆盖全部状态), 按 pageNo 翻页取满 limit
+                raw = await page.evaluate(
+                    """async ([api, maxItems]) => {
+                        const items = [];
+                        let totalCount = null;
+                        // 单页上限保守取 50(首页实测 pageSize=5 正常), 最多翻 5 页
+                        const pageSize = Math.min(Math.max(maxItems, 1), 50);
+                        for (let pageNo = 1; pageNo <= 5 && items.length < maxItems; pageNo++) {
+                            const url = `${api}?pageNo=${pageNo}&pageSize=${pageSize}`
+                                + '&order=desc&orderBy=createTime&publishStatusSet=0,1,2';
+                            const resp = await fetch(url, {credentials: 'include'});
+                            if (!resp.ok) return {error: `http ${resp.status}`};
+                            const j = await resp.json();
+                            if (j.code !== 0) return {error: `code ${j.code} ${j.msg || ''}`};
+                            const d = j.data || {};
+                            totalCount = d.totalCount;
+                            items.push(...(d.result || []));
+                            if (pageNo >= (d.totalPages || 1)) break;
+                        }
+                        return {items: items.slice(0, maxItems), totalCount};
+                    }""",
+                    [_WORKS_LIST_API, max(int(limit or 20), 1)],
+                )
+                if not isinstance(raw, dict) or raw.get("error"):
+                    logger.info(
+                        "[爱奇艺作品列表] 接口返回异常(未登录/风控?): %s", raw
+                    )
+                    return []
+
+                works = []
+                for it in raw.get("items") or []:
+                    qipu_id = it.get("qipuId")
+                    works.append({
+                        # qipuId 即平台作品唯一 ID, 公开页 URL 由 pageUrl 直接给出
+                        "work_id": str(qipu_id) if qipu_id is not None else "",
+                        "work_type": "video",
+                        "title": str(it.get("displayName") or "").strip(),
+                        "publish_time": str(it.get("publishTime") or "").strip(),
+                        # 公开作品页, 接口原样返回(如 http://www.iqiyi.com/v_xxx.html)
+                        "url": str(it.get("pageUrl") or "").strip(),
+                        "views": _to_int(it.get("vvNum")),        # 播放量
+                        "likes": _to_int(it.get("upCount")),       # 点赞(赞)
+                        "favorites": _to_int(it.get("favCount")),  # 收藏
+                        "comments": _to_int(it.get("commentCount")),  # 评论
+                        "share": _to_int(it.get("shareCount")),    # 分享
+                        # 契约外附带字段: 审核状态(已发布/审核中等), 排查用
+                        "status": str(it.get("videoStatus") or "").strip(),
+                    })
+
+                logger.info(
+                    "[爱奇艺作品列表] 抓到 %d 条作品(接口共 %s 条)",
+                    len(works), raw.get("totalCount", "?"),
+                )
+                return works
+            except Exception as e:
+                logger.info("[爱奇艺作品列表] 抓取失败: %s", e)
+                return []
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.info("[爱奇艺作品列表] list_works 失败: %s", e)
+            return []
+        finally:
+            await browser.close()

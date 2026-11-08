@@ -38,6 +38,15 @@ logger = get_channel_logger("vivo")
 _VIVO_HOME_URL = "https://www.kaixinkan.com.cn/#/home"
 _VIVO_UPLOAD_URL = "https://www.kaixinkan.com.cn/#/content/uploads"
 
+# 内容管理列表页(hash SPA; 2026-11 踩点实证)
+_VIVO_MANAGE_URL_HASH = "#/content/manage"
+# 公开作品分享页模板(踩点: 管理页「分享」按钮复制的链接即此形态,
+# videoId 与列表 contentId 一一对应, 无需逐行点分享)
+_VIVO_SHARE_URL_TPL = (
+    "https://v.kaixinkan.com.cn/share.html?videoId={content_id}"
+    "&_appSource=PCcreator&sourceType=6"
+)
+
 # 视频上传最大等待时间(文档:不超过 2G / 90min,这里给足 4 小时)
 _UPLOAD_MAX_WAIT = 4 * 60 * 60
 
@@ -407,6 +416,9 @@ class VivoPlatform(BasePlatform):
         dry_run=True 时填完所有字段后**停在发布界面**(不点提交按钮),
         让用户观察填写结果。设置环境变量 ``VIVO_DRY_RUN=1`` 启用。
         """
+        log_dir = Path(BASE_DIR / "logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+
         logger.info("[上传视频] 开始上传视频: %s", file_path)
         browser = await self.create_browser(headless=False)
         try:
@@ -456,6 +468,17 @@ class VivoPlatform(BasePlatform):
                     return
 
                 await asyncio.sleep(2)
+
+                # 表单渲染截图(发布佐证,失败不影响发布)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "vivo_before_form.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] 表单截图失败(不影响发布): %s", e
+                    )
 
                 # 3. 视频描述 + 标签(#xxx 直接拼在描述里,总长≤500字)
                 # contenteditable 富文本,按 CLAUDE.md 用 press_sequentially 逐字符输入
@@ -538,6 +561,17 @@ class VivoPlatform(BasePlatform):
                 else:
                     logger.info("[定时发布] 立即发布,跳过定时设置")
 
+                # 提交前截图(全部字段填写完成,发布佐证)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "vivo_before_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] 提交前截图失败(不影响发布): %s", e
+                    )
+
                 # 9.5 dry_run 模式:填完所有字段后停在发布界面,不点提交
                 #     让用户在浏览器里观察填写结果(便于调试表单字段)
                 if dry_run:
@@ -573,6 +607,17 @@ class VivoPlatform(BasePlatform):
 
                 if not success:
                     logger.warning("[提交] 提交后未检测到页面跳转,可能发布失败")
+
+                # 提交后截图(发布佐证,失败不影响发布)
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "vivo_after_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[上传视频] 提交后截图失败(不影响发布): %s", e
+                    )
 
                 # 12. 回写 cookie
                 await context.storage_state(path=account_file)
@@ -980,3 +1025,206 @@ class VivoPlatform(BasePlatform):
             logger.error("[定时发布] 设置失败: %s", e)
             import traceback
             logger.error("[定时发布] traceback: %s", traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    # list_works — 内容管理页作品列表(回链与统计同步)
+    # ------------------------------------------------------------------
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list:
+        """抓取内容管理页(#/content/manage)的作品列表(按发布时间倒序)。
+
+        实现(2026-11 踩点 scratch/scout_vivo2~6 实证):
+          1. 直接 goto 管理页会丢登录态(SPA 需先走 #/home 引导), 所以先
+             goto #/home 等 .user-info-area 资料卡, 再 SPA 内改 hash 进列表页。
+          2. 列表数据接口 contentManager/page.dhtml 的请求/响应均为 jvq 加密
+             ({"jvq_response":"..."}), 页内 fetch 拿不到明文 → 改读 Vue 组件
+             $data.contentList(渲染数据源, 含 contentId/postTime/整数统计)。
+          3. 公开作品页 = 管理页「分享」按钮复制的链接, 与 contentId 一一
+             对应, 直接按模板拼接, 不逐行点分享(避免弹窗/剪贴板副作用)。
+
+        work_type 仅支持 'video'(vivo 只有视频内容); 其它类型 → []。
+        statistics: 播放/点赞/转发/评论(无收藏字段 → favorites=None)。
+        任何异常(含 cookie 失效)只记日志并返回 [], 不抛出。
+        """
+        if work_type != "video":
+            return []
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+
+                # 1. 先走 #/home 完成 SPA 登录态引导
+                try:
+                    await page.goto(
+                        _VIVO_HOME_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                except Exception:
+                    pass
+                try:
+                    await page.wait_for_selector(".user-info-area", timeout=15000)
+                except Exception:
+                    pass
+                if not await page.locator(".user-info-area").count():
+                    logger.info(
+                        "[vivo 作品列表] cookie 失效(首页无用户资料卡) url=%s",
+                        page.url,
+                    )
+                    return []
+
+                # 2. SPA 内 hash 导航到内容管理列表页(hash 变更不整页重载)
+                await page.evaluate(
+                    "location.hash = '%s'" % _VIVO_MANAGE_URL_HASH
+                )
+                # 有作品时等「发布于」行渲染; 空账号超时属正常, 由下方读数兜底
+                try:
+                    await page.wait_for_selector("text=发布于", timeout=15000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+                if _VIVO_MANAGE_URL_HASH.lstrip("#") not in (page.url or ""):
+                    logger.info(
+                        "[vivo 作品列表] 未进入内容管理页(url=%s)", page.url
+                    )
+                    return []
+
+                # 3. 读 Vue 组件 $data.contentList + 分页状态, 不够 limit 时
+                #    点「下一页」补抓(每页 20 条, 最多 5 页, 防异常翻页死循环)
+                items = []
+                seen_ids = set()
+                for _round in range(5):
+                    batch = await page.evaluate(
+                        """() => {
+                            function findListComp(comp, depth) {
+                                if (!comp || depth > 12) return null;
+                                if (comp.$data
+                                    && Array.isArray(comp.$data.contentList))
+                                    return comp;
+                                for (const c of comp.$children || []) {
+                                    const hit = findListComp(c, depth + 1);
+                                    if (hit) return hit;
+                                }
+                                return null;
+                            }
+                            const root = document.querySelector('#app');
+                            const t = root && root.__vue__
+                                ? findListComp(root.__vue__, 0) : null;
+                            if (!t) return {error: 'list comp not found'};
+                            const d = t.$data;
+                            return {
+                                pageNum: d.page && d.page.pageNum,
+                                total: d.page && d.page.total,
+                                items: (d.contentList || []).map(it => ({
+                                    contentId: it.contentId,
+                                    title: it.title,
+                                    postTime: it.postTime,
+                                    status: it.status,
+                                    views: it.vivoViewCounts,
+                                    likes: it.likeCounts,
+                                    shares: it.sharedCounts,
+                                    comments: it.commentCounts,
+                                })),
+                            };
+                        }"""
+                    )
+                    if not isinstance(batch, dict) or batch.get("error"):
+                        logger.info(
+                            "[vivo 作品列表] Vue 数据读取失败: %s", batch
+                        )
+                        break
+                    fresh = 0
+                    for it in batch.get("items") or []:
+                        cid = str(it.get("contentId") or "")
+                        if not cid or cid in seen_ids:
+                            continue
+                        seen_ids.add(cid)
+                        items.append(it)
+                        fresh += 1
+                    if len(items) >= max(int(limit or 20), 1) or fresh == 0:
+                        break
+                    total = batch.get("total") or 0
+                    if total and len(items) >= int(total):
+                        break
+                    # 翻页: 点 .btn-next, 无按钮/已到末页(pageNum 不前进)即止
+                    btn = page.locator(".el-pagination .btn-next").first
+                    if not await btn.count():
+                        break
+                    before = batch.get("pageNum")
+                    await btn.click()
+                    await asyncio.sleep(2)
+                    after = await page.evaluate(
+                        """() => {
+                            function findListComp(comp, depth) {
+                                if (!comp || depth > 12) return null;
+                                if (comp.$data
+                                    && Array.isArray(comp.$data.contentList))
+                                    return comp;
+                                for (const c of comp.$children || []) {
+                                    const hit = findListComp(c, depth + 1);
+                                    if (hit) return hit;
+                                }
+                                return null;
+                            }
+                            const root = document.querySelector('#app');
+                            const t = root && root.__vue__
+                                ? findListComp(root.__vue__, 0) : null;
+                            return t && t.$data.page
+                                ? t.$data.page.pageNum : null;
+                        }"""
+                    )
+                    if after is None or after == before:
+                        break
+
+                # 4. 映射契约 dict(status 语义来自管理页筛选: 1已发布 2审核中 3未通过)
+                from datetime import datetime
+
+                status_text = {1: "已发布", 2: "审核中", 3: "未通过"}
+                works = []
+                for it in items[: max(int(limit or 20), 1)]:
+                    cid = str(it.get("contentId") or "")
+                    # postTime 即页面展示的「发布于」时间(踩点已核对)
+                    ts = it.get("postTime") or 0
+                    try:
+                        publish_time = datetime.fromtimestamp(
+                            int(ts) / 1000
+                        ).strftime("%Y-%m-%d %H:%M:%S")
+                    except (ValueError, TypeError, OSError, OverflowError):
+                        publish_time = ""
+                    works.append({
+                        "work_id": cid,
+                        "work_type": "video",
+                        "title": str(it.get("title") or "").strip(),
+                        "publish_time": publish_time,
+                        "url": (
+                            _VIVO_SHARE_URL_TPL.format(content_id=cid)
+                            if cid else ""
+                        ),
+                        "views": it.get("views"),
+                        "likes": it.get("likes"),
+                        "favorites": None,  # vivo 管理页无收藏字段
+                        "comments": it.get("comments"),
+                        "share": it.get("shares"),
+                        # 附带字段: 审核状态文案(契约外, 排查用)
+                        "status": status_text.get(it.get("status"), ""),
+                    })
+                logger.info(
+                    "[vivo 作品列表] 抓到 %d 条作品 (total=%s)",
+                    len(works),
+                    (batch.get("total") if isinstance(batch, dict) else None),
+                )
+                return works
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.warning("[vivo 作品列表] list_works 失败: %s", exc)
+            return []
+        finally:
+            await self.close_browser(browser, is_close_by_code=True)

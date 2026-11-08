@@ -567,6 +567,15 @@ class TaskQueue:
             platform = get_platform(task.platform_type)
             if not platform:
                 raise ValueError(f"不支持的平台类型: {task.platform_type}")
+            # 存草稿护栏:is_draft=True 时平台必须显式声明支持平台官方草稿箱
+            # (supports_video_draft)。不支持的直接任务失败,防止「想存草稿却真发了」
+            if (task.payload or {}).get('is_draft') and not getattr(
+                platform, 'supports_video_draft', False
+            ):
+                raise ValueError(
+                    f"{task.platform} 暂不支持发布到平台官方草稿箱,"
+                    "请改用「直接发布」模式"
+                )
             publish_fn = platform.publish_video
             if asyncio.iscoroutinefunction(publish_fn):
                 return await publish_fn(**task.payload)

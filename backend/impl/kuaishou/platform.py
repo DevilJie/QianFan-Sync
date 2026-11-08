@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
 
@@ -51,6 +52,48 @@ _KS_MAX_TAGS = 4
 # 取此值或空时跳过 _set_author_declaration，不去快手发布页查找下拉选项，
 # 避免因页面上无匹配项而 wait_for 超时。视频和图集发布共用此约定。
 _DECLARATION_NONE = "内容无需添加声明"
+
+# 快手图集单次最多图片数(2026-11-08 发布页文案实证:「支持最多31张,最大15MB的
+# 图片文件」)。超限时上传区变红色错误框,编辑页永不出现
+_KS_MAX_IMAGES = 31
+
+# ---------------------------------------------------------------------------
+# list_works (作品列表抓取: 作品回链 + 统计同步)
+# ---------------------------------------------------------------------------
+
+# 已发布列表页。踩点实证(2026-11-02): status 参数 1=已发布 2=待发布 0=全部作品;
+# 视频与图集都在这一页混排(发布终点同页, 见 _KS_MANAGE_URL_PATTERN), 无独立图集列表。
+_KS_MANAGE_PUBLISHED_URL = "https://cp.kuaishou.com/article/manage/video?status=1"
+
+# 页面加载时自动请求的作品列表接口, 响应 data.list 含 workId/标题/播放/点赞/评论。
+# DOM 里没有任何作品链接, workId 只能从这个接口拿。
+_KS_PHOTO_LIST_URL_KEYWORD = "/rest/cp/works/v2/video/pc/photo/list"
+
+# 接口改版时的 DOM 兜底提取: .video-item 行的标题/日期/三项统计(按图标 src 关键字区分)。
+_KS_VIDEO_ITEMS_JS = """() => {
+  const rows = [];
+  document.querySelectorAll('.video-item').forEach(item => {
+    const titleEl = item.querySelector('.video-item__detail__row__title');
+    const dateEl = item.querySelector('.video-item__detail__row__date');
+    const stats = {};
+    item.querySelectorAll('.video-item__detail__row__label').forEach(labelEl => {
+      const img = labelEl.querySelector('img');
+      const src = img ? (img.getAttribute('src') || '') : '';
+      let key = '';
+      if (src.indexOf('icon-play') >= 0) key = 'views';
+      else if (src.indexOf('icon_comment') >= 0) key = 'comments';
+      else if (src.indexOf('icon-like') >= 0) key = 'likes';
+      if (key) stats[key] = (labelEl.textContent || '').trim();
+    });
+    rows.push({
+      title: titleEl ? (titleEl.textContent || '').trim() : '',
+      time: dateEl ? (dateEl.textContent || '').trim() : '',
+      is_video: !!item.querySelector('.video-item__cover__duration'),
+      stats: stats,
+    });
+  });
+  return rows;
+}"""
 
 
 class KuaishouPlatform(BasePlatform):
@@ -431,6 +474,16 @@ class KuaishouPlatform(BasePlatform):
                 f"快手标签最多 {_KS_MAX_TAGS} 个, 当前 {len(tags)} 个"
             )
 
+        # 图集数量校验:快手最多 31 张(2026-11-08 发布页文案实证)。
+        # 超限不报错 —— 按用户约定「超出的图片直接丢弃」,只保留前 31 张
+        if len(files) > _KS_MAX_IMAGES:
+            logger.warning(
+                "[发布校验] 快手图集图片超出上限: 当前 %d 张, 最多 %d 张,"
+                " 自动丢弃超出部分, 仅保留前 %d 张",
+                len(files), _KS_MAX_IMAGES, _KS_MAX_IMAGES,
+            )
+            files = files[:_KS_MAX_IMAGES]
+
         # 打印所有接收到的参数
         logger.info("[发布参数] 接收到的所有参数:")
         for key, value in kwargs.items():
@@ -520,10 +573,27 @@ class KuaishouPlatform(BasePlatform):
                 await asyncio.sleep(2)
 
                 # 3. 等编辑页加载（URL 不会变，等描述输入框出现即可）
+                # 多图上传时服务端处理较慢,超时放宽到 120s;仍超时通常是
+                # 上传区报错(图片超限/格式不支持),截图在 except 里有记录
                 logger.info("[上传图集] 等待编辑页加载...")
-                await page.locator("#work-description-edit").wait_for(state="visible", timeout=30000)
+                await page.locator("#work-description-edit").wait_for(
+                    state="visible", timeout=120000
+                )
                 logger.info("[上传图集] 编辑页已加载, URL: %s", page.url)
                 await asyncio.sleep(1)
+
+                # Pre-form screenshot
+                log_dir = Path(BASE_DIR / "logs")
+                try:
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    await page.screenshot(
+                        path=str(log_dir / "kuaishou_image_before_form.png"),
+                        full_page=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[表单截图] kuaishou_image_before_form.png 保存失败(非致命): %s", exc
+                    )
 
                 # 4. 关闭引导弹层
                 await self._close_guide_overlay(page)
@@ -576,6 +646,17 @@ class KuaishouPlatform(BasePlatform):
                         await self._set_schedule_time(page, publish_date)
                         logger.info("[定时发布] 定时发布设置完成")
 
+                # Pre-submit screenshot
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "kuaishou_image_before_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[表单截图] kuaishou_image_before_submit.png 保存失败(非致命): %s", exc
+                    )
+
                 logger.info("[填写完成] 表单填写完成, 模式: %s", "演练(dry_run)" if dry_run else "正式发布")
 
                 if not dry_run:
@@ -591,10 +672,35 @@ class KuaishouPlatform(BasePlatform):
                             timeout=60000,
                         )
                     logger.info("[发布] 图集发布成功!")
+
+                    # Post-submit screenshot
+                    try:
+                        await page.screenshot(
+                            path=str(log_dir / "kuaishou_image_after_submit.png"),
+                            full_page=True,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[表单截图] kuaishou_image_after_submit.png 保存失败(非致命): %s", exc
+                        )
+
                     await context.storage_state(path=account_file)
                     logger.info("[发布] Cookie状态已更新")
                 else:
                     raise RuntimeError('演练模式未实际发布，不计为发布成功')
+            except Exception:
+                # 流程异常必须落日志(此前异常被 finally 静默吞掉,页面状态无从排查)
+                logger.error("[上传图集] 图集发布流程异常", exc_info=True)
+                try:
+                    log_dir = Path(BASE_DIR / "logs")
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    await page.screenshot(
+                        path=str(log_dir / "kuaishou_image_error.png"),
+                        full_page=True,
+                    )
+                except Exception:
+                    pass
+                raise
             finally:
                 if not dry_run:
                     await context.close()
@@ -624,6 +730,15 @@ class KuaishouPlatform(BasePlatform):
         - ``desc`` (*str*, optional)
         - ``schedule_time_str`` (*str*, optional)
         - ``author_declaration`` (*str*, optional)
+        - ``ks_mini_app_link`` (*str*, optional) -- 作者服务「关联小程序」的
+          小程序页面链接(从快手APP复制);空=不设置作者服务
+        - ``ks_location_name`` (*str*, optional) -- 「添加地点」详细地址 POI
+          名称(来自 /api/kuaishou/search-position);空=不设置地点
+        - ``ks_visibility`` (*str*, optional) -- 「查看权限」:所有人可见/
+          好友可见/仅自己可见;空或所有人可见=保持页面默认
+        - ``ks_allow_same_frame`` (*bool*, optional) -- 互动设置:允许别人跟我拍同框
+        - ``ks_allow_download`` (*bool*, optional) -- 互动设置:允许下载此作品
+        - ``ks_nearby_show`` (*bool*, optional) -- 互动设置:作品展示在同城页
         """
         import asyncio as _aio
 
@@ -675,6 +790,18 @@ class KuaishouPlatform(BasePlatform):
         # （参见 services/draft_merge.py DECLARATION_PLATFORMS['kuaishou']='aiContent'）
         # author_declaration 仅作别名兼容旧调用
         author_declaration = kwargs.get("ai_content", "") or kwargs.get("author_declaration", "")
+        # 快手特有可选项(2026-11-11 新增):作者服务/添加地点/互动设置/查看权限
+        ks_mini_app_link = kwargs.get("ks_mini_app_link", "") or ""
+        ks_location_name = kwargs.get("ks_location_name", "") or ""
+        ks_visibility = kwargs.get("ks_visibility", "") or ""
+        # 互动设置三项:页面默认全勾选,缺省(旧草稿/旧调用)视为 True 保持页面默认
+        def _ks_bool(key: str) -> bool:
+            val = kwargs.get(key)
+            return True if val is None else bool(val)
+
+        ks_allow_same_frame = _ks_bool("ks_allow_same_frame")
+        ks_allow_download = _ks_bool("ks_allow_download")
+        ks_nearby_show = _ks_bool("ks_nearby_show")
 
         # 固定使用 4:3 横版封面（用户要求），竖版/通用仅作缺失兜底
         cover_path = thumbnail_landscape_path or thumbnail_portrait_path or thumbnail_path
@@ -724,6 +851,12 @@ class KuaishouPlatform(BasePlatform):
                         publish_date=pub_date,
                         enable_timer=enable_timer,
                         video_format=video_format,
+                        ks_mini_app_link=ks_mini_app_link,
+                        ks_location_name=ks_location_name,
+                        ks_visibility=ks_visibility,
+                        ks_allow_same_frame=ks_allow_same_frame,
+                        ks_allow_download=ks_allow_download,
+                        ks_nearby_show=ks_nearby_show,
                     )
 
         logger.info("=" * 60)
@@ -746,6 +879,12 @@ class KuaishouPlatform(BasePlatform):
         publish_date,
         enable_timer: bool,
         video_format: str = "landscape",
+        ks_mini_app_link: str = "",
+        ks_location_name: str = "",
+        ks_visibility: str = "",
+        ks_allow_same_frame: bool = True,
+        ks_allow_download: bool = True,
+        ks_nearby_show: bool = True,
     ):
         browser = await self.create_browser(headless=False)
         upload_success = False
@@ -780,6 +919,19 @@ class KuaishouPlatform(BasePlatform):
 
             # ------ Dismiss guide overlay ------
             await self._close_guide_overlay(page)
+
+            # Pre-form screenshot
+            log_dir = Path(BASE_DIR / "logs")
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+                await page.screenshot(
+                    path=str(log_dir / "kuaishou_before_form.png"),
+                    full_page=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[表单截图] kuaishou_before_form.png 保存失败(非致命): %s", exc
+                )
 
             # ------ Fill description + tags ------
             logger.info("[填写简介] 开始填写简介与标签...")
@@ -843,6 +995,26 @@ class KuaishouPlatform(BasePlatform):
                 await self._set_schedule_time(page, publish_date)
                 logger.info("[定时发布] 定时发布设置完成")
 
+            # ------ 快手特有可选项(失败均不阻塞发布) ------
+            # 作者服务(关联小程序) → 添加地点 → 互动设置 → 查看权限
+            await self._set_author_service(page, ks_mini_app_link)
+            await self._set_location(page, ks_location_name)
+            await self._set_interaction(
+                page, ks_allow_same_frame, ks_allow_download, ks_nearby_show
+            )
+            await self._set_visibility(page, ks_visibility)
+
+            # Pre-submit screenshot
+            try:
+                await page.screenshot(
+                    path=str(log_dir / "kuaishou_before_submit.png"),
+                    full_page=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[表单截图] kuaishou_before_submit.png 保存失败(非致命): %s", exc
+                )
+
             # ------ Click publish ------
             if manual_review_enabled():
                 await wait_for_manual_publish(page, 'kuaishou')
@@ -870,6 +1042,17 @@ class KuaishouPlatform(BasePlatform):
                     except Exception as exc:
                         logger.info("[发布] 发布重试: %s", exc)
                         await asyncio.sleep(1)
+
+            # Post-submit screenshot
+            try:
+                await page.screenshot(
+                    path=str(log_dir / "kuaishou_after_submit.png"),
+                    full_page=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[表单截图] kuaishou_after_submit.png 保存失败(非致命): %s", exc
+                )
 
             upload_success = True
         finally:
@@ -1321,6 +1504,236 @@ class KuaishouPlatform(BasePlatform):
             logger.info("[作者声明] 作者声明设置失败 (非致命): %s", exc)
 
     # ------------------------------------------------------------------
+    # Helper: 作者服务 - 关联小程序(ant-select + 链接输入)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _set_author_service(page, mini_app_link: str):
+        """设置「作者服务」为关联小程序并填入小程序链接。
+
+        DOM(2026-11-07 发布页踩点):作者服务区块是
+        ``div[class*="_author-turning-item"]``,内含一个 ant-select
+        (placeholder「选择服务类型」,唯一选项「关联小程序」)。
+        选中「关联小程序」后,区块内出现第二个 ant-select 输入框
+        (placeholder「前往快手APP小程序复制页面链接…」),粘贴链接后
+        页面调 /rest/cp/works/v2/video/pc/relation/list 校验,无效链接
+        下拉提示「您关联的小程序页面无法访问」。
+        全程失败不阻塞发布(可选项)。
+        """
+        if not mini_app_link:
+            logger.info("[作者服务] 未填小程序链接,跳过作者服务设置")
+            return
+        logger.info("[作者服务] 开始设置作者服务: 关联小程序 %s", mini_app_link)
+        try:
+            item = page.locator('div[class*="_author-turning-item"]').first
+            if not await item.count():
+                logger.info("[作者服务] 未找到作者服务区块,跳过")
+                return
+            await item.scroll_into_view_if_needed()
+
+            # 1. 服务类型下拉 → 选「关联小程序」
+            service_select = item.locator(".ant-select").first
+            await service_select.click()
+            await asyncio.sleep(1)
+            option = page.locator("div.ant-select-item-option:has-text('关联小程序')").first
+            if not await option.count():
+                logger.info("[作者服务] 下拉中未找到「关联小程序」选项(可能已选或改版),跳过")
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                return
+            await option.click()
+            await asyncio.sleep(1.5)
+
+            # 2. 小程序链接输入框(区块内第二个 ant-select 的搜索输入)填链接
+            link_select = item.locator(".ant-select").nth(1)
+            if not await link_select.count():
+                logger.info("[作者服务] 未出现小程序链接输入框,跳过填链接")
+                return
+            link_input = link_select.locator("input.ant-select-selection-search-input").first
+            if not await link_input.count():
+                # 兜底:区块内任意可见输入框
+                link_input = item.locator("input:visible").first
+            await link_input.click()
+            await link_input.fill(str(mini_app_link))
+            await asyncio.sleep(2)
+            # 回车确认(有效链接时页面校验通过即关联;无效链接仅提示,不阻塞)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(1)
+            await page.keyboard.press("Escape")
+            logger.info("[作者服务] 已填入小程序链接")
+        except Exception as exc:
+            logger.info("[作者服务] 作者服务设置失败 (非致命): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Helper: 添加地点(地区级联 + 详细地址 POI 下拉)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _set_location(page, poi_title: str):
+        """设置「添加地点」:选定地区(IP 定位城市)后按名称选详细地址 POI。
+
+        DOM(2026-11-07 发布页踩点):「添加地点」区块是
+        ``div[class*="_edit-form-item"]`` 含 label「添加地点」,内有两个控件:
+          1. 地区级联 ``.ant-select.ant-cascader``(placeholder 请选择所在地区),
+             首级只有 IP 定位城市一项(``.ant-cascader-menu-item``),点它即选定;
+          2. 详细地址 ``.ant-select``(placeholder 请输入视频详细地址…),
+             选定地区前为 disabled;点击展开会请求附近 POI,输入关键词触发
+             POST /rest/zt/location/wi/poi/search,下拉项文本=title+address 拼接。
+        全程失败不阻塞发布(可选项)。
+        """
+        if not poi_title:
+            logger.info("[添加地点] 未填地点,跳过")
+            return
+        logger.info("[添加地点] 开始设置地点: %s", poi_title)
+        try:
+            item = page.locator(
+                'div[class*="_edit-form-item"]',
+                has=page.get_by_text("添加地点", exact=True),
+            ).first
+            if not await item.count():
+                logger.info("[添加地点] 未找到添加地点区块,跳过")
+                return
+            await item.scroll_into_view_if_needed()
+
+            # 1. 地区级联 → 点唯一项(IP 定位城市)
+            cascader = item.locator(".ant-select.ant-cascader").first
+            await cascader.click()
+            await asyncio.sleep(1.5)
+            city_option = page.locator(".ant-cascader-menu-item").first
+            if not await city_option.count():
+                logger.info("[添加地点] 地区级联未出现选项,跳过")
+                return
+            await city_option.click()
+            await asyncio.sleep(1.5)
+            logger.info("[添加地点] 已选地区(级联第一项)")
+
+            # 2. 详细地址下拉 → 输入地点名 → 按 title 匹配选项点击
+            detail = item.locator(".ant-select").nth(1)
+            await detail.click()
+            await asyncio.sleep(1)
+            search_input = detail.locator("input.ant-select-selection-search-input").first
+            await search_input.fill("")
+            await search_input.type(poi_title, delay=120)
+            # 等 POI 搜索响应渲染到下拉
+            option = page.locator(
+                f'div.ant-select-item-option:has-text("{poi_title}")'
+            ).first
+            for _ in range(20):
+                if await option.count():
+                    break
+                await asyncio.sleep(0.5)
+            if not await option.count():
+                logger.info("[添加地点] 下拉中未匹配到「%s」,跳过(不阻塞发布)", poi_title)
+                try:
+                    await page.keyboard.press("Escape")
+                except Exception:
+                    pass
+                return
+            await option.click()
+            await asyncio.sleep(1)
+            logger.info("[添加地点] 已选择地点: %s", poi_title)
+        except Exception as exc:
+            logger.info("[添加地点] 地点设置失败 (非致命): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Helper: 互动设置(ant-checkbox-group)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _set_interaction(
+        page,
+        allow_same_frame: bool,
+        allow_download: bool,
+        nearby_show: bool,
+    ):
+        """设置「互动设置」三个勾选项(与目标状态不一致才点击)。
+
+        DOM(2026-11-07 发布页踩点):互动设置区块是
+        ``div[class*="_edit-form-item"]`` 含 label「互动设置」,内为
+        ``.ant-checkbox-group`` 的 3 个 ``label.ant-checkbox-wrapper``:
+        允许别人跟我拍同框 / 允许下载此作品 / 作品展示在同城页
+        (页面默认全勾选)。全程失败不阻塞发布(可选项)。
+        """
+        targets = [
+            ("允许别人跟我拍同框", allow_same_frame),
+            ("允许下载此作品", allow_download),
+            ("作品展示在同城页", nearby_show),
+        ]
+        logger.info(
+            "[互动设置] 目标: 拍同框=%s 允许下载=%s 同城展示=%s",
+            allow_same_frame, allow_download, nearby_show,
+        )
+        try:
+            item = page.locator(
+                'div[class*="_edit-form-item"]',
+                has=page.get_by_text("互动设置", exact=True),
+            ).first
+            if not await item.count():
+                logger.info("[互动设置] 未找到互动设置区块,跳过")
+                return
+            for label_text, want in targets:
+                wrapper = item.locator(
+                    f"label.ant-checkbox-wrapper:has-text('{label_text}')"
+                ).first
+                if not await wrapper.count():
+                    logger.info("[互动设置] 未找到选项「%s」,跳过", label_text)
+                    continue
+                cls = await wrapper.get_attribute("class") or ""
+                checked = "ant-checkbox-wrapper-checked" in cls
+                if checked == want:
+                    logger.info("[互动设置] 「%s」已是目标状态(%s)", label_text, want)
+                    continue
+                await wrapper.click()
+                await asyncio.sleep(0.5)
+                logger.info("[互动设置] 已切换「%s」→ %s", label_text, want)
+        except Exception as exc:
+            logger.info("[互动设置] 互动设置失败 (非致命): %s", exc)
+
+    # ------------------------------------------------------------------
+    # Helper: 查看权限(ant-radio-group)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _set_visibility(page, visibility_label: str):
+        """设置「查看权限」radio(所有人可见/好友可见/仅自己可见)。
+
+        DOM(2026-11-07 发布页踩点):查看权限区块是
+        ``div[class*="_edit-form-item"]`` 含 label「查看权限」,内为
+        ``.ant-radio-group`` 的 3 个 ``label.ant-radio-wrapper``(input
+        value: 所有人可见=1 / 好友可见=4 / 仅自己可见=2,默认所有人可见)。
+        空值或「所有人可见」(页面默认)直接跳过。全程失败不阻塞发布。
+        """
+        if not visibility_label or visibility_label == "所有人可见":
+            logger.info("[查看权限] 未指定或默认所有人可见,跳过")
+            return
+        logger.info("[查看权限] 开始设置查看权限: %s", visibility_label)
+        try:
+            item = page.locator(
+                'div[class*="_edit-form-item"]',
+                has=page.get_by_text("查看权限", exact=True),
+            ).first
+            if not await item.count():
+                logger.info("[查看权限] 未找到查看权限区块,跳过")
+                return
+            wrapper = item.locator(
+                f"label.ant-radio-wrapper:has-text('{visibility_label}')"
+            ).first
+            if not await wrapper.count():
+                logger.info("[查看权限] 未找到选项「%s」,跳过", visibility_label)
+                return
+            cls = await wrapper.get_attribute("class") or ""
+            if "ant-radio-wrapper-checked" in cls:
+                logger.info("[查看权限] 「%s」已是选中状态", visibility_label)
+                return
+            await wrapper.click()
+            await asyncio.sleep(0.5)
+            logger.info("[查看权限] 已选择: %s", visibility_label)
+        except Exception as exc:
+            logger.info("[查看权限] 查看权限设置失败 (非致命): %s", exc)
+
+    # ------------------------------------------------------------------
     # Helper: set schedule time (ant-radio + ant-picker)
     # ------------------------------------------------------------------
 
@@ -1345,3 +1758,166 @@ class KuaishouPlatform(BasePlatform):
         await clear_and_type(page, date_str)
         await page.keyboard.press("Enter")
         await asyncio.sleep(1)
+
+    # ------------------------------------------------------------------
+    # list_works() — 作品列表抓取(作品回链 + 统计同步)
+    # ------------------------------------------------------------------
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list:
+        """抓取作品管理页「已发布」tab 的作品列表(按发布时间倒序)。
+
+        实现方式(2026-11-02 踩点实证, 样本见 scratch/ks_manage_published.html):
+        - 直接 goto status=1(已发布), 页面加载时自动请求 photo/list 接口,
+          拦截该响应拿 workId/标题/播放/点赞/评论(DOM 里没有任何作品链接)
+        - 接口改版时降级为 DOM 提取(.video-item 行, 无 workId)
+        - 列表无 收藏/分享 列, 这两项恒为 None
+        - 视频与图集同页混排: showDuration=true 为视频, 否则按图集处理
+          (本账号暂无图集作品, 图集标记未能实测, 见报告)
+
+        work_type='video'/'image' 都抓同一页后按类型过滤; 'article' 不支持返回 []。
+        异常一律 log + return [], 不抛出。
+        """
+        if work_type == "article":
+            return []
+        if work_type not in ("video", "image", ""):
+            return []
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+            try:
+                api_items: list = []
+                got_list = asyncio.Event()
+
+                async def _on_response(resp) -> None:
+                    try:
+                        if _KS_PHOTO_LIST_URL_KEYWORD not in resp.url:
+                            return
+                        payload = await resp.json()
+                        items = ((payload or {}).get("data") or {}).get("list") or []
+                        if items:
+                            api_items.extend(items)
+                            got_list.set()
+                    except Exception:
+                        pass
+
+                page.on("response", _on_response)
+                try:
+                    await page.goto(
+                        _KS_MANAGE_PUBLISHED_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    await page.wait_for_selector(".video-item", timeout=15000)
+                except Exception as exc:
+                    # 未渲染出列表: 区分 cookie 失效(登录页出现)和页面异常
+                    try:
+                        await page.wait_for_selector(
+                            _COOKIE_INVALID_SELECTOR, timeout=3000
+                        )
+                        logger.info("[kuaishou list_works] cookie 已失效(跳登录页)")
+                    except Exception:
+                        logger.info(f"[kuaishou list_works] 打开作品管理页失败: {exc}")
+                    return []
+
+                # 等列表接口返回(登录态下通常 1-2s 内)
+                try:
+                    await asyncio.wait_for(got_list.wait(), timeout=8)
+                except asyncio.TimeoutError:
+                    logger.info("[kuaishou list_works] 未拦截到列表接口, 走 DOM 兜底")
+
+                if api_items:
+                    rows = []
+                    for item in api_items:
+                        work_id = str(item.get("workId") or "")
+                        is_video = bool(item.get("showDuration")) or bool(
+                            item.get("durationSecond")
+                        )
+                        publish_time = ""
+                        upload_ms = item.get("uploadTime")
+                        if upload_ms:
+                            try:
+                                publish_time = datetime.fromtimestamp(
+                                    int(upload_ms) / 1000
+                                ).strftime("%Y-%m-%d %H:%M")
+                            except (ValueError, TypeError, OSError):
+                                publish_time = ""
+                        rows.append({
+                            "work_id": work_id,
+                            "work_type": "video" if is_video else "image",
+                            "title": str(item.get("title") or "").strip(),
+                            "publish_time": publish_time,
+                            "url": (
+                                f"https://www.kuaishou.com/short-video/{work_id}"
+                                if work_id else ""
+                            ),
+                            "views": item.get("playCount")
+                            if isinstance(item.get("playCount"), int) else None,
+                            "likes": item.get("likeCount")
+                            if isinstance(item.get("likeCount"), int) else None,
+                            "favorites": None,  # 管理页不提供收藏数
+                            "comments": item.get("commentCount")
+                            if isinstance(item.get("commentCount"), int) else None,
+                            "share": None,      # 管理页不提供分享数
+                        })
+                    source = "接口"
+                else:
+                    # DOM 兜底: 接口拿不到时从 .video-item 行提取(无 workId)
+                    raw_rows = await page.evaluate(_KS_VIDEO_ITEMS_JS)
+                    rows = []
+                    for row in raw_rows:
+                        stats = row.get("stats") or {}
+                        rows.append({
+                            "work_id": "",
+                            "work_type": "video" if row.get("is_video") else "image",
+                            "title": str(row.get("title") or ""),
+                            "publish_time": str(row.get("time") or ""),
+                            "url": "",
+                            "views": _parse_ks_count(stats.get("views")),
+                            "likes": _parse_ks_count(stats.get("likes")),
+                            "favorites": None,
+                            "comments": _parse_ks_count(stats.get("comments")),
+                            "share": None,
+                        })
+                    source = "DOM 兜底"
+
+                if work_type:
+                    rows = [r for r in rows if r["work_type"] == work_type]
+                logger.info(
+                    "[kuaishou list_works] 抓到 %d 条作品(%s, work_type=%s, 返回 %d 条)",
+                    len(rows), source, work_type or "全部", len(rows[:limit]),
+                )
+                return rows[:limit]
+            except Exception as exc:
+                logger.info(f"[kuaishou list_works] 抓取失败: {exc}")
+                return []
+            finally:
+                await context.close()
+        except Exception as exc:
+            logger.info(f"[kuaishou list_works] 抓取失败: {exc}")
+            return []
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+def _parse_ks_count(text):
+    """DOM 兜底用: '29'/'1.2万'/'-' -> int, 解析失败返回 None。"""
+    t = str(text or "").strip().replace(",", "").replace(" ", "")
+    if not t or not t[0].isdigit():
+        return None
+    mult = 1
+    if t.endswith("万"):
+        mult, t = 10000, t[:-1]
+    elif t.endswith("亿"):
+        mult, t = 100000000, t[:-1]
+    try:
+        return int(float(t) * mult)
+    except ValueError:
+        return None

@@ -584,6 +584,19 @@ class DouyinPlatform(BasePlatform):
 
                 await asyncio.sleep(1)
 
+                # Pre-form screenshot
+                log_dir = Path(BASE_DIR / "logs")
+                try:
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    await page.screenshot(
+                        path=str(log_dir / "douyin_before_form.png"),
+                        full_page=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[表单截图] douyin_before_form.png 保存失败(非致命): %s", exc
+                    )
+
                 # Append activities as hashtags to description (与图文发布一致)
                 if activities:
                     activity_tags = " ".join([f"#{act}" for act in activities])
@@ -675,6 +688,17 @@ class DouyinPlatform(BasePlatform):
                     await self._set_schedule_time(page, publish_date)
                     logger.info("[定时发布] 定时发布设置完成")
 
+                # Pre-submit screenshot
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "douyin_before_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[表单截图] douyin_before_submit.png 保存失败(非致命): %s", exc
+                    )
+
                 # 调试:输出本次发布的全部参数(便于人工核对填写是否正确)
                 logger.info("=" * 60)
                 logger.info("[发布调试] ===== 本次发布参数汇总 (dry_run=%s) =====", _PUBLISH_DRY_RUN)
@@ -726,6 +750,17 @@ class DouyinPlatform(BasePlatform):
                             # Maybe a cover selection is required
                             await self._handle_auto_video_cover(page)
                             await asyncio.sleep(0.5)
+
+                # Post-submit screenshot
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "douyin_after_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[表单截图] douyin_after_submit.png 保存失败(非致命): %s", exc
+                    )
 
                 # Save updated cookie state
                 await context.storage_state(path=account_file)
@@ -1294,6 +1329,19 @@ class DouyinPlatform(BasePlatform):
 
                 await asyncio.sleep(5)  # 等待更长时间确保页面加载完成
 
+                # Pre-form screenshot
+                log_dir = Path(BASE_DIR / "logs")
+                try:
+                    log_dir.mkdir(parents=True, exist_ok=True)
+                    await page.screenshot(
+                        path=str(log_dir / "douyin_image_before_form.png"),
+                        full_page=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[表单截图] douyin_image_before_form.png 保存失败(非致命): %s", exc
+                    )
+
                 # 逐字输入标题
                 logger.info("[填写标题] 开始填写标题: %s", title[:20])
                 title_input = page.get_by_placeholder("添加作品标题")
@@ -1363,6 +1411,17 @@ class DouyinPlatform(BasePlatform):
                         await self._set_schedule_time(page, publish_date)
                         logger.info("[定时发布] 定时发布设置完成")
 
+                # Pre-submit screenshot
+                try:
+                    await page.screenshot(
+                        path=str(log_dir / "douyin_image_before_submit.png"),
+                        full_page=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[表单截图] douyin_image_before_submit.png 保存失败(非致命): %s", exc
+                    )
+
                 logger.info("[填写完成] 表单填写完成, 模式: %s", "演练(dry_run)" if dry_run else "正式发布")
 
                 if not dry_run:
@@ -1396,6 +1455,17 @@ class DouyinPlatform(BasePlatform):
                                 result = False
                     if manual_review_enabled():
                         result = True
+
+                    # Post-submit screenshot
+                    try:
+                        await page.screenshot(
+                            path=str(log_dir / "douyin_image_after_submit.png"),
+                            full_page=True,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[表单截图] douyin_image_after_submit.png 保存失败(非致命): %s", exc
+                        )
 
                     # Save cookie state
                     await context.storage_state(path=account_file)
@@ -1936,3 +2006,130 @@ class DouyinPlatform(BasePlatform):
             logger.warning(
                 "[内容声明] 声明设置失败 (非阻断): %s", exc
             )
+
+    # ------------------------------------------------------------------
+    # list_works — 内容管理页作品列表(作品回链 + 统计同步数据源)
+    # ------------------------------------------------------------------
+
+    # 内容管理页(manage-v2)的 DOM 不含任何作品链接/ID, 列表数据全部来自
+    # 该 JSON 接口(踩点 2026-11-02 实证)。接口无需 msToken/a_bogus 签名,
+    # 页面上下文内 fetch 直调即可(同源带 cookie)。
+    _WORK_LIST_PATH = "/janus/douyin/creator/pc/work_list"
+    _MANAGE_PAGE_URL = "https://creator.douyin.com/creator-micro/content/manage"
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list:
+        """抓取内容管理页作品列表(按发布时间倒序), 供回链与统计同步。
+
+        work_type 路由: 'video' 视频 / 'image' 图集(图文) — 两者同在内容
+        管理页一个列表里, 按 work_list 条目的 images 字段区分; 平台不支持
+        的类型(如 'article')返回 []。公开 URL 模板: 视频
+        ``www.douyin.com/video/{aweme_id}``, 图集 ``www.douyin.com/note/{aweme_id}``。
+        任何异常(含 cookie 失效)只记日志并返回 [], 不抛出。
+        """
+        if work_type not in ("video", "image"):
+            return []
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                try:
+                    await page.goto(
+                        self._MANAGE_PAGE_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+                # cookie 失效: 被跳转到登录页 → 返回 []
+                if "content/manage" not in (page.url or ""):
+                    logger.info("[抖音作品列表] cookie 失效(跳转 %s)", page.url)
+                    return []
+
+                # 页内 fetch 直调作品列表接口; 首次请求常一次性返回 count 条,
+                # 不够时按 max_cursor 翻页(最多 5 轮, 防接口 count 上限)
+                raw = await page.evaluate(
+                    """async (args) => {
+                        const [path, count] = args;
+                        const items = [];
+                        let maxCursor = 0;
+                        for (let round = 0; round < 5; round++) {
+                            const qs = new URLSearchParams({
+                                status: '0', count: String(count),
+                                max_cursor: String(maxCursor),
+                                scene: 'star_atlas',
+                                device_platform: 'android',
+                                cookie_enabled: 'true',
+                                aid: '1128', support_h265: '0',
+                            });
+                            const resp = await fetch(`${path}?${qs}`, {
+                                credentials: 'include',
+                            });
+                            if (!resp.ok) return {error: `http ${resp.status}`};
+                            const data = await resp.json();
+                            if (data.status_code !== 0) {
+                                return {error: `status_code ${data.status_code}`};
+                            }
+                            items.push(...(data.aweme_list || []));
+                            if (!data.has_more || items.length >= count) {
+                                return {items};
+                            }
+                            maxCursor = data.max_cursor || 0;
+                            if (!maxCursor) return {items};
+                        }
+                        return {items};
+                    }""",
+                    [self._WORK_LIST_PATH, max(int(limit or 20), 1)],
+                )
+                if not isinstance(raw, dict) or raw.get("error"):
+                    logger.info("[抖音作品列表] 接口返回异常: %s", raw)
+                    return []
+
+                works = []
+                for it in raw.get("items") or []:
+                    aweme_id = str(it.get("aweme_id") or "")
+                    # images 非空 = 图集(图文); aweme_type 2/68 也是图文形态
+                    is_image = bool(it.get("images")) or it.get("aweme_type") in (2, 68)
+                    if (work_type == "image") != is_image:
+                        continue
+                    st = it.get("statistics") or {}
+                    try:
+                        publish_time = time.strftime(
+                            "%Y-%m-%d %H:%M", time.localtime(int(it.get("create_time") or 0))
+                        )
+                    except Exception:
+                        publish_time = ""
+                    works.append({
+                        "work_id": aweme_id,
+                        "work_type": "image" if is_image else "video",
+                        "title": str(it.get("item_title") or it.get("desc") or "").strip(),
+                        "publish_time": publish_time,
+                        "url": (
+                            f"https://www.douyin.com/note/{aweme_id}" if is_image
+                            else f"https://www.douyin.com/video/{aweme_id}"
+                        ),
+                        "views": st.get("play_count"),
+                        "likes": st.get("digg_count"),
+                        "favorites": st.get("collect_count"),
+                        "comments": st.get("comment_count"),
+                        "share": st.get("share_count"),
+                    })
+                    if len(works) >= limit:
+                        break
+                logger.info(
+                    "[抖音作品列表] work_type=%s 过滤后 %d 条(接口共 %d 条)",
+                    work_type, len(works), len(raw.get("items") or []),
+                )
+                return works
+            finally:
+                await context.close()
+        except Exception as exc:
+            logger.warning("[抖音作品列表] list_works 失败: %s", exc)
+            return []
+        finally:
+            await self.close_browser(browser, is_close_by_code=True)

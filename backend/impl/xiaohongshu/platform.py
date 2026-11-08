@@ -42,6 +42,8 @@ _XHS_PUBLISH_VIDEO_URL = (
 _XHS_PUBLISH_IMAGE_URL = (
     "https://creator.xiaohongshu.com/publish/publish?from=menu&target=image"
 )
+# 笔记管理页(视频/图文混排, 发布成功白名单页之一, 见 _manual_review.is_success_url)
+_XHS_NOTE_MANAGER_URL = "https://creator.xiaohongshu.com/new/note-manager"
 _XHS_LOGIN_BOX_SELECTOR = "div[class*='login-box']"
 _XHS_LOGIN_SWITCH_SELECTOR = "img.css-wemwzq"
 _PUBLISH_STRATEGY_IMMEDIATE = "immediate"
@@ -65,6 +67,68 @@ def _count_hashtags(text: str) -> int:
     if not text:
         return 0
     return len(_HASHTAG_PATTERN.findall(text))
+
+
+# 笔记管理页 .note-card__stat 的统计图标 svg path 前缀 -> 字段
+# (2026-11-02 踩点实证, 样本见 scratch/xhs_notes.html)
+_XHS_STAT_ICON_MAP = {
+    "M7.99902 3.83398": "views",      # 眼睛 = 观看(浏览)
+    "M3.18233 10.985": "comments",    # 气泡 = 评论
+    "M3.25611 3.91336": "likes",      # 心形 = 点赞
+    "M10.8848 14.2322": "favorites",  # 五角星 = 收藏
+    "M8.28672 5.15797": "share",      # 箭头 = 分享
+}
+
+
+def _parse_xhs_count(text: str):
+    """把列表页数字文本转 int: '29' / '1.2万' / '3亿' -> int, 解析失败返回 None。"""
+    t = (text or "").strip().replace(",", "").replace(" ", "")
+    if not t:
+        return None
+    mult = 1
+    if t.endswith("万"):
+        mult, t = 10000, t[:-1]
+    elif t.endswith("亿"):
+        mult, t = 100000000, t[:-1]
+    try:
+        return int(float(t) * mult)
+    except ValueError:
+        return None
+
+
+# 笔记管理页卡片提取脚本: 一次性抓所有 .note-card 的
+# note_id(data-impression JSON) / 标题 / 时间 / 类型标记 / 行内统计。
+# stats 只回传 (图标 path 前缀, 数字文本), 字段归由 Python 侧映射。
+_XHS_NOTE_CARDS_JS = """() => {
+  const cards = [];
+  document.querySelectorAll('.note-card').forEach(card => {
+    let noteId = '';
+    try {
+      const imp = JSON.parse(card.getAttribute('data-impression') || '{}');
+      noteId = (imp.noteTarget && imp.noteTarget.value
+                && imp.noteTarget.value.noteId) || '';
+    } catch (e) { noteId = ''; }
+    const titleEl = card.querySelector('.note-card__title');
+    const timeEl = card.querySelector('.note-card__time');
+    const stats = [];
+    card.querySelectorAll('.note-card__stat').forEach(statEl => {
+      const path = statEl.querySelector('svg path');
+      const numEl = statEl.querySelector('span');
+      stats.push({
+        d: path ? (path.getAttribute('d') || '').slice(0, 40) : '',
+        num: numEl ? (numEl.textContent || '').trim() : '',
+      });
+    });
+    cards.push({
+      note_id: noteId,
+      title: titleEl ? (titleEl.textContent || '').trim() : '',
+      time: timeEl ? (timeEl.textContent || '').trim() : '',
+      is_video: !!card.querySelector('.play_time'),
+      stats: stats,
+    });
+  });
+  return cards;
+}"""
 
 
 # ======================================================================
@@ -599,6 +663,130 @@ class XiaohongshuPlatform(BasePlatform):
         logger.info("=" * 60)
         return success_count > 0
 
+    # ------------------------------------------------------------------
+    # list_works() — 作品列表抓取(作品回链 + 统计同步)
+    # ------------------------------------------------------------------
+
+    async def list_works(
+        self, cookie_file: str, limit: int = 20, work_type: str = ""
+    ) -> list:
+        """抓取笔记管理页的作品列表(按发布时间倒序)。
+
+        页面结构(2026-11-02 踩点实证, 样本见 scratch/xhs_notes.html):
+        - 视频与图文在 .notes-container 里混排(只有 全部/已发布/审核中/未通过
+          状态 tab, 无类型 tab), 靠 .play_time 时长标记区分: 有 = 视频
+        - note_id 藏在卡片的 data-impression 属性(JSON, noteTarget.value.noteId),
+          页面没有任何 <a> 链接
+        - 行内统计五项按图标区分(见 _XHS_STAT_ICON_MAP)
+
+        work_type='video'/'image' 都抓同一页后按类型过滤; 'article' 不支持返回 []。
+        异常一律 log + return [], 不抛出。
+        """
+        if work_type == "article":
+            return []
+        if work_type not in ("video", "image", ""):
+            return []
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+            try:
+                try:
+                    await page.goto(
+                        _XHS_NOTE_MANAGER_URL,
+                        wait_until="domcontentloaded",
+                        timeout=30000,
+                    )
+                    await page.wait_for_selector(".note-card", timeout=15000)
+                except Exception as exc:
+                    logger.info(f"[xhs list_works] 打开笔记管理页失败: {exc}")
+                    return []
+                if _XHS_LOGIN_URL in (page.url or ""):
+                    logger.info("[xhs list_works] cookie 已失效(跳登录页)")
+                    return []
+
+                # 混排列表按需滚动: 目标类型攒够 limit 或连续两轮无新增即停。
+                # 用鼠标滚轮(而非 window.scrollTo), 兼容内层滚动容器。
+                want_video = work_type != "image"
+
+                def _count_cards(cards: list) -> int:
+                    if not work_type:
+                        return len(cards)
+                    return sum(1 for c in cards if c.get("is_video") is want_video)
+
+                cards = []
+                last_total, stable = -1, 0
+                for _ in range(10):
+                    viewport = page.viewport_size or {"width": 1280, "height": 720}
+                    await page.mouse.move(
+                        viewport["width"] / 2, viewport["height"] / 2
+                    )
+                    await page.mouse.wheel(0, 3000)
+                    await asyncio.sleep(1.2)
+                    cards = await page.evaluate(_XHS_NOTE_CARDS_JS)
+                    total = len(cards)
+                    if _count_cards(cards) >= limit:
+                        break
+                    if total == last_total:
+                        stable += 1
+                        if stable >= 2:
+                            break
+                    else:
+                        stable = 0
+                    last_total = total
+
+                works = []
+                for card in cards:
+                    note_id = str(card.get("note_id") or "")
+                    # 图标 path 前缀 -> 统计字段, 数字文本 -> int(识别不出 = None)
+                    stat_values = {"views": None, "likes": None,
+                                   "favorites": None, "comments": None,
+                                   "share": None}
+                    for stat in card.get("stats") or []:
+                        d = str(stat.get("d") or "")
+                        for prefix, field in _XHS_STAT_ICON_MAP.items():
+                            if d.startswith(prefix):
+                                stat_values[field] = _parse_xhs_count(
+                                    stat.get("num")
+                                )
+                                break
+                    works.append({
+                        "work_id": note_id,
+                        "work_type": "video" if card.get("is_video") else "image",
+                        "title": str(card.get("title") or ""),
+                        "publish_time": str(card.get("time") or ""),
+                        "url": (
+                            f"https://www.xiaohongshu.com/explore/{note_id}"
+                            if note_id else ""
+                        ),
+                        "views": stat_values["views"],
+                        "likes": stat_values["likes"],
+                        "favorites": stat_values["favorites"],
+                        "comments": stat_values["comments"],
+                        "share": stat_values["share"],
+                    })
+                if work_type:
+                    works = [
+                        w for w in works if w["work_type"] == work_type
+                    ]
+                logger.info(
+                    "[xhs list_works] 抓到 %d 条笔记(work_type=%s, 返回 %d 条)",
+                    len(cards), work_type or "全部", len(works[:limit]),
+                )
+                return works[:limit]
+            except Exception as exc:
+                logger.info(f"[xhs list_works] 抓取失败: {exc}")
+                return []
+            finally:
+                await context.close()
+        except Exception as exc:
+            logger.info(f"[xhs list_works] 抓取失败: {exc}")
+            return []
+        finally:
+            await browser.close()
+
 
 # ======================================================================
 # Internal publish helper
@@ -696,6 +884,10 @@ async def _publish_single_image(
     (XiaohongshuPlatform.publish_image) 传入 ``self.create_browser``，确保
     与其他平台一致地经过 BasePlatform 统一入口。
     """
+    # 表单截图目录(供 E2E 测试报告做平台表单填写佐证)
+    log_dir = Path(BASE_DIR / "logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
     browser = await create_browser_fn(headless=False)
     try:
         context = await create_context_fn(browser, storage_state=account_file)
@@ -730,6 +922,15 @@ async def _publish_single_image(
             # Wait for page readiness
             await asyncio.sleep(2)
 
+            # 表单截图钩子: 图片上传完成、表单渲染就绪(供 E2E 报告佐证)
+            try:
+                await page.screenshot(
+                    path=str(log_dir / "xiaohongshu_image_before_form.png"),
+                    full_page=True,
+                )
+            except Exception as exc:
+                logger.warning("[截图钩子] before_form 截图失败(不影响发布): %s", exc)
+
             # Fill title, description, tags
             logger.info("[填写标题] 开始填写标题、简介与标签...")
             await _fill_title(page, title)
@@ -761,6 +962,15 @@ async def _publish_single_image(
             # Wait for publish button to hydrate
             await _wait_for_page_ready(page)
 
+            # 表单截图钩子: 全部字段填写完成、点击发布前(供 E2E 报告核心佐证)
+            try:
+                await page.screenshot(
+                    path=str(log_dir / "xiaohongshu_image_before_submit.png"),
+                    full_page=True,
+                )
+            except Exception as exc:
+                logger.warning("[截图钩子] before_submit 截图失败(不影响发布): %s", exc)
+
             if not dry_run:
                 # Click publish
                 btn_text = "定时发布" if is_scheduled else "发布"
@@ -783,6 +993,15 @@ async def _publish_single_image(
                         return False
             else:
                 raise RuntimeError('演练模式未实际发布，不计为发布成功')
+
+            # 表单截图钩子: 发布提交成功后、流程收尾前(供 E2E 报告佐证)
+            try:
+                await page.screenshot(
+                    path=str(log_dir / "xiaohongshu_image_after_submit.png"),
+                    full_page=True,
+                )
+            except Exception as exc:
+                logger.warning("[截图钩子] after_submit 截图失败(不影响发布): %s", exc)
 
             # Save cookies
             await context.storage_state(path=account_file)
@@ -860,6 +1079,10 @@ async def _upload_video_content(
 ):
     """All browser interaction for a single XHS video upload."""
 
+    # 表单截图目录(供 E2E 测试报告做平台表单填写佐证)
+    log_dir = Path(BASE_DIR / "logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
     logger.info("[上传视频] 开始上传视频: %s", title)
     await page.goto(_XHS_PUBLISH_VIDEO_URL)
     await page.wait_for_url(_XHS_PUBLISH_VIDEO_URL)
@@ -920,6 +1143,15 @@ async def _upload_video_content(
     finally:
         await cdp.detach()
 
+    # 表单截图钩子: 表单渲染就绪(上传完成、发布按钮可用,供 E2E 报告佐证)
+    try:
+        await page.screenshot(
+            path=str(log_dir / "xiaohongshu_before_form.png"),
+            full_page=True,
+        )
+    except Exception as exc:
+        logger.warning("[截图钩子] before_form 截图失败(不影响发布): %s", exc)
+
     # --- Fill title (20 char limit) ---
     logger.info("[填写标题] 开始填写标题、简介与标签...")
     await _fill_title(page, title)
@@ -963,6 +1195,15 @@ async def _upload_video_content(
 
     # --- Wait for publish button to hydrate ---
     await _wait_for_page_ready(page)
+
+    # 表单截图钩子: 全部字段填写完成、点击发布前(供 E2E 报告核心佐证)
+    try:
+        await page.screenshot(
+            path=str(log_dir / "xiaohongshu_before_submit.png"),
+            full_page=True,
+        )
+    except Exception as exc:
+        logger.warning("[截图钩子] before_submit 截图失败(不影响发布): %s", exc)
 
     # --- 调试:输出本次发布的全部参数(便于人工核对填写是否正确) ---
     logger.info("=" * 60)
@@ -1025,6 +1266,16 @@ async def _upload_video_content(
             logger.info("[发布] 已等待 %d 秒,继续等待(可能正在等待人工验证)...", wait_seconds)
 
     logger.info("[发布] 视频发布成功! 页面URL: %s", page.url)
+
+    # 表单截图钩子: 发布提交成功后、流程收尾前(供 E2E 报告佐证)
+    try:
+        await page.screenshot(
+            path=str(log_dir / "xiaohongshu_after_submit.png"),
+            full_page=True,
+        )
+    except Exception as exc:
+        logger.warning("[截图钩子] after_submit 截图失败(不影响发布): %s", exc)
+
     return True
 
 

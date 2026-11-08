@@ -47,6 +47,22 @@ export const historyApi = {
   },
 }
 
+// 作品数据同步（作品回链 + 统计同步）
+export const worksApi = {
+  // 立即触发一轮统计同步（后端异步执行）；detailIds 缺省时同步全部
+  sync(detailIds) {
+    return http.post('/api/v2/works/sync', detailIds?.length ? { detail_ids: detailIds } : {})
+  },
+  // 同步状态: { running, last_synced_at, interval_minutes, enabled }
+  syncStatus() {
+    return http.get('/api/v2/works/sync-status')
+  },
+  // 手动补绑一个批次所有成功明细的作品链接，返回绑定结果
+  bindWorks(batchId) {
+    return http.post(`/api/v2/history/${batchId}/bind-works`)
+  },
+}
+
 // 统计数据
 export const statsApi = {
   getStats() {

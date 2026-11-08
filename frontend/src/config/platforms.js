@@ -257,6 +257,8 @@ export const PLATFORMS = {
     bgColor: 'rgba(230, 78, 58, 0.15)',
     cssClass: 'baijiahao',
     creatorUrl: 'https://baijiahao.baidu.com/',
+    // 渠道说明: 发布中心渠道设置区顶部展示(渲染于 PublishCenter 平台 note 位)
+    note: '百家号视频：标题仅存于发布记录，平台作品标题取描述内容',
     settingsFields: [
       { key: 'isOriginal', label: '原创声明', type: 'radio', options: [{ label: '原创', value: true }, { label: '非原创', value: false }] },
       { key: 'creationDeclaration', label: '必选声明', type: 'select', required: true, placeholder: '选择必选声明', options: [
