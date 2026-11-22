@@ -21,6 +21,12 @@ def init_database():
     conn = sqlite3.connect(str(DB_PATH))
     cursor = conn.cursor()
 
+    # WAL 模式：读写不互斥，显著降低并发写下的 database is locked（库级持久设置，幂等）
+    try:
+        cursor.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as e:
+        logger.warning(f"启用 WAL 模式失败（不影响启动）: {e}")
+
     # 原始表
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS user_info (

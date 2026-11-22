@@ -462,7 +462,7 @@ def _bind_details(conn, rows, now: datetime) -> list[dict]:
 
     按 (account_id, work_type) 分组（account_id 决定平台与 cookie）；
     组间随机 sleep 3~8 秒；单组失败不影响其它组。
-    只写库不 commit（调用方负责），返回每个 detail 的绑定结果。
+    每组写库后立即 commit（短事务），返回每个 detail 的绑定结果。
     """
     groups: dict[tuple, list[dict]] = {}
     for r in rows:
@@ -503,6 +503,9 @@ def _bind_details(conn, rows, now: datetime) -> list[dict]:
                     results.append(_bind_result(d, False, "退避窗口未到，本轮跳过"))
                     continue
                 results.append(_bind_one(conn, d, works, now))
+            # 每组提交：先释放写锁，再进入下一组的 sleep / list_works（慢操作），
+            # 避免长时间持锁阻塞上传视频等其他写库（database is locked）
+            conn.commit()
         except Exception as exc:
             # 单组失败不影响其它组（§2.3 步骤 5）
             logger.warning(
@@ -646,6 +649,8 @@ def _sync_round(detail_ids=None, wait_lock: bool = False) -> bool:
                 "DELETE FROM publish_work_stats WHERE captured_at < datetime('now', ?)",
                 (f"-{_STATS_RETENTION_DAYS} day",),
             )
+            # 立即提交：不要带着这把写锁进入下方组间 sleep / list_works（慢操作）
+            conn.commit()
 
             groups: dict[tuple, list[dict]] = {}
             for r in rows:
