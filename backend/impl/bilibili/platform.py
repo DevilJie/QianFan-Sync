@@ -2282,7 +2282,25 @@ class BilibiliPlatform(BasePlatform):
                         { credentials: 'include' });
                     const top = await topResp.json();
                     const topUpper = top?.data?.top?.upper
-                        ? { rpid: String(top.data.top.upper.rpid) }
+                        ? { rpid: String(top.data.top.upper.rpid),
+                            author: top.data.top.upper.member?.uname || '',
+                            avatar: top.data.top.upper.member?.avatar || '',
+                            content: top.data.top.upper.content?.message || '',
+                            like: top.data.top.upper.like || 0,
+                            rcount: top.data.top.upper.rcount || 0,
+                            ctime: top.data.top.upper.ctime || 0,
+                            location: (top.data.top.upper.reply_control?.location || '').replace(/^IP属地：/, ''),
+                            mid: top.data.top.upper.member?.mid || '',
+                            children: (top.data.top.upper.replies || []).map(c => ({
+                                rpid: String(c.rpid),
+                                author: c.member?.uname || '',
+                                avatar: c.member?.avatar || '',
+                                content: c.content?.message || '',
+                                like: c.like || 0,
+                                ctime: c.ctime || 0,
+                                location: (c.reply_control?.location || '').replace(/^IP属地：/, ''),
+                                mid: c.member?.mid || '',
+                            })) }
                         : null;
                     const out = [];
                     let next = 0;
@@ -2370,6 +2388,38 @@ class BilibiliPlatform(BasePlatform):
                         "is_author": bool(owner_mid_s) and str(c.get("mid") or "") == owner_mid_s,
                         "pinned": False,
                     })
+
+            # 置顶评论不在 replies 列表中时单独补入（B站将其单独放在 data.top.upper）
+            top = result.get("top") or {}
+            if top_rpid and top.get("content") is not None and \
+                    not any(c["comment_id"] == top_rpid for c in comments):
+                comments.insert(0, {
+                    "comment_id": top_rpid,
+                    "parent_id": "",
+                    "author": top.get("author") or "",
+                    "avatar": top.get("avatar") or "",
+                    "content": top.get("content") or "",
+                    "like_count": int(top.get("like") or 0),
+                    "reply_count": int(top.get("rcount") or 0),
+                    "publish_time": _fmt(top.get("ctime")),
+                    "location": top.get("location") or "",
+                    "is_author": bool(owner_mid_s) and str(top.get("mid") or "") == owner_mid_s,
+                    "pinned": True,
+                })
+                for c in top.get("children") or []:
+                    comments.append({
+                        "comment_id": c["rpid"],
+                        "parent_id": top_rpid,
+                        "author": c.get("author") or "",
+                        "avatar": c.get("avatar") or "",
+                        "content": c.get("content") or "",
+                        "like_count": int(c.get("like") or 0),
+                        "reply_count": 0,
+                        "publish_time": _fmt(c.get("ctime")),
+                        "location": c.get("location") or "",
+                        "is_author": bool(owner_mid_s) and str(c.get("mid") or "") == owner_mid_s,
+                        "pinned": False,
+                    })
             logger.info(f"[bilibili list_comments] {bvid} 抓到 {len(comments)} 条评论")
             return comments
         except Exception as e:
@@ -2421,22 +2471,31 @@ class BilibiliPlatform(BasePlatform):
                     if (pinned && rpid) {
                         // 置顶契约（bilibili-API-collect comment/action.md）：
                         // body 传 rpid + action=1（数字），不是 rpyid/action=top
-                        const topBody = new URLSearchParams({
-                            oid: String(aid), type: '1', rpid: rpid,
-                            action: '1', csrf: csrf, csrf_token: csrf,
-                        });
-                        const topResp = await fetch('https://api.bilibili.com/x/v2/reply/top', {
-                            method: 'POST', credentials: 'include',
-                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                            body: topBody.toString(),
-                        });
-                        const top = await topResp.json();
-                        if (top.code !== 0) {
-                            return { ok: true, comment_id: rpid,
-                                     message: '评论已发布，但置顶失败: ' + (top.message || top.code) };
+                        // 刚发的评论在 B 站索引里可能未生效（报 12006「啥都木有」），
+                        // 需要间隔重试：最多 8 次 × 2s
+                        let pinnedOk = false, lastErr = '';
+                        for (let i = 0; i < 8; i++) {
+                            await new Promise(r => setTimeout(r, i === 0 ? 500 : 2000));
+                            const topBody = new URLSearchParams({
+                                oid: String(aid), type: '1', rpid: rpid,
+                                action: '1', csrf: csrf, csrf_token: csrf,
+                            });
+                            const topResp = await fetch('https://api.bilibili.com/x/v2/reply/top', {
+                                method: 'POST', credentials: 'include',
+                                headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                                body: topBody.toString(),
+                            });
+                            const top = await topResp.json();
+                            if (top.code === 0) { pinnedOk = true; break; }
+                            lastErr = top.message || String(top.code);
                         }
+                        if (!pinnedOk) {
+                            return { ok: true, comment_id: rpid, pinned: false,
+                                     message: '评论已发布，但置顶失败: ' + lastErr };
+                        }
+                        return { ok: true, comment_id: rpid, pinned: true, message: '' };
                     }
-                    return { ok: true, comment_id: rpid, message: '' };
+                    return { ok: true, comment_id: rpid, pinned: false, message: '' };
                 }
                 """,
                 [bvid, content.strip(), bool(pinned)],
@@ -2446,11 +2505,13 @@ class BilibiliPlatform(BasePlatform):
                 logger.info(f"[bilibili post_comment] {bvid} 失败: {msg}")
                 return {"ok": False, "message": msg}
             logger.info(
-                f"[bilibili post_comment] {bvid} 发布成功 rpid={result.get('comment_id')} pinned={pinned}"
+                f"[bilibili post_comment] {bvid} 发布成功 rpid={result.get('comment_id')} "
+                f"pinned={result.get('pinned')} msg={result.get('message')!r}"
             )
             return {
                 "ok": True,
                 "comment_id": result.get("comment_id") or "",
+                "pinned": bool(result.get("pinned")),
                 "message": result.get("message") or "",
             }
         except Exception as e:

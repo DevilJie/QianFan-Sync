@@ -88,9 +88,14 @@ def _resolve_work_id(detail: dict) -> str:
     return ""
 
 
-def _upsert_comment_row(detail: dict, c: dict) -> None:
-    """单条评论落库（幂等：同 detail + comment_id 覆盖）。"""
-    conn = sqlite3.connect(str(DB_PATH))
+def _upsert_comment_row(detail: dict, c: dict, conn=None) -> None:
+    """单条评论落库（幂等：同 detail + comment_id 覆盖）。
+
+    conn 为 None 时自开自关；调用方传入连接时复用（批量同步在同一事务内）。
+    """
+    own = conn is None
+    if own:
+        conn = sqlite3.connect(str(DB_PATH))
     try:
         conn.execute(
             """INSERT INTO work_comments
@@ -116,9 +121,11 @@ def _upsert_comment_row(detail: dict, c: dict) -> None:
                 1 if c.get("is_author") else 0, 1 if c.get("pinned") else 0,
             ),
         )
-        conn.commit()
+        if own:
+            conn.commit()
     finally:
-        conn.close()
+        if own:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +178,8 @@ def _run_post(task_id: str, detail_id: str, content: str, pinned: bool) -> None:
             _tasks[task_id].update(status="error", error=result.get("message") or "发评失败")
         return
 
-    # 自己的评论落库（置顶标记按平台返回；置顶失败也先按发布成功展示）
+    # 自己的评论落库（置顶标记以平台实际返回为准）
+    pinned_ok = bool(result.get("pinned"))
     try:
         _upsert_comment_row(detail, {
             "comment_id": result.get("comment_id") or f"local-{task_id[:8]}",
@@ -180,7 +188,7 @@ def _run_post(task_id: str, detail_id: str, content: str, pinned: bool) -> None:
             "like_count": 0, "reply_count": 0,
             "publish_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "location": "", "is_author": True,
-            "pinned": pinned and not result.get("message"),
+            "pinned": pinned_ok,
         })
     except Exception as exc:
         logger.warning("[Comments] 自己的评论落库失败(不影响结果): %s", exc)
@@ -189,9 +197,13 @@ def _run_post(task_id: str, detail_id: str, content: str, pinned: bool) -> None:
         _tasks[task_id].update(status="done", result={
             "ok": True,
             "comment_id": result.get("comment_id") or "",
-            "message": result.get("message") or ("评论已发布并置顶" if pinned else "评论已发布"),
+            "pinned": pinned_ok,
+            "message": result.get("message") or ("评论已发布并置顶" if pinned_ok else "评论已发布"),
         })
-    logger.info("[Comments] 发评完成 detail=%s work=%s pinned=%s", detail_id, work_id, pinned)
+    logger.info(
+        "[Comments] 发评完成 detail=%s work=%s pinned_ok=%s",
+        detail_id, work_id, pinned_ok,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +252,16 @@ def _run_sync(task_id: str, detail_id: str) -> None:
         return
 
     try:
-        for c in comments:
-            _upsert_comment_row(detail, c)
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            # 整明细替换：先删旧数据（平台上已删除的评论不再残留），再插入本轮快照
+            # （delete + 全部 upsert 共用同一连接同一事务，避免自锁）
+            conn.execute("DELETE FROM work_comments WHERE detail_id = ?", (detail_id,))
+            for c in comments:
+                _upsert_comment_row(detail, c, conn)
+            conn.commit()
+        finally:
+            conn.close()
     except Exception as exc:
         _finish_error(task_id, f"评论落库失败: {exc}")
         return
