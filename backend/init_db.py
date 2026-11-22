@@ -377,6 +377,33 @@ def migrate_database():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pws_detail ON publish_work_stats(detail_id, captured_at DESC)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_pws_batch ON publish_work_stats(batch_id)")
 
+    # 作品评论表（评论同步 / 一键评论落库；detail_id 对应 publish_details.id）
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS work_comments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        detail_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL DEFAULT '',
+        account_id INTEGER,
+        platform_id INTEGER,
+        work_id TEXT NOT NULL DEFAULT '',
+        comment_id TEXT NOT NULL DEFAULT '',
+        parent_id TEXT NOT NULL DEFAULT '',
+        author TEXT NOT NULL DEFAULT '',
+        avatar TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL DEFAULT '',
+        like_count INTEGER DEFAULT 0,
+        reply_count INTEGER DEFAULT 0,
+        publish_time TEXT NOT NULL DEFAULT '',
+        location TEXT NOT NULL DEFAULT '',
+        is_author INTEGER NOT NULL DEFAULT 0,
+        pinned INTEGER NOT NULL DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """)
+    # 同一明细下按平台评论 ID 幂等（重复同步不产生重复行）
+    cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_wc_detail_comment ON work_comments(detail_id, comment_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_wc_detail ON work_comments(detail_id, pinned DESC, like_count DESC)")
+
     conn.commit()
     conn.close()
 

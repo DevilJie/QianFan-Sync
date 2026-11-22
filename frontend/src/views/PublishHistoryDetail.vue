@@ -150,24 +150,28 @@
               </footer>
             </section>
 
-            <!-- 评论区（演示数据：评论同步后端接入后替换为真实数据） -->
+            <!-- 评论区（数据来自后端评论同步 work_comments 表） -->
             <section class="comments-card">
               <header class="comments-header">
                 <h3 class="section-title">
                   评论
                   <span class="comment-count">{{ commentTotal }}</span>
-                  <span class="mock-chip" title="评论同步功能接入前的演示数据">演示数据</span>
                 </h3>
                 <div class="comments-toolbar">
                   <div class="sort-tabs">
                     <button :class="{ active: commentSort === 'hot' }" @click="commentSort = 'hot'">最热</button>
                     <button :class="{ active: commentSort === 'new' }" @click="commentSort = 'new'">最新</button>
                   </div>
-                  <el-button size="small" :icon="Refresh" @click="syncComments">同步评论</el-button>
+                  <el-button size="small" :icon="ChatDotRound" :disabled="commentDisabled" @click="openCommentDialog">一键评论</el-button>
+                  <el-button size="small" :icon="Refresh" :loading="commentsSyncing" :disabled="commentDisabled" @click="syncComments">同步评论</el-button>
                 </div>
               </header>
 
-              <div class="comment-list">
+              <div v-if="commentsLoading" class="comments-empty">评论加载中…</div>
+              <div v-else-if="!displayComments.length" class="comments-empty">
+                暂无评论数据，点击右上角「同步评论」从平台拉取
+              </div>
+              <div v-else class="comment-list">
                 <div v-for="(c, i) in displayComments" :key="c.id" class="comment-item">
                   <div class="comment-avatar" :style="{ background: avatarColor(i) }">{{ c.author.charAt(0) }}</div>
                   <div class="comment-main">
@@ -202,6 +206,32 @@
                   </div>
                 </div>
               </div>
+
+              <!-- 一键评论弹窗：输入内容 → 浏览器自动化发评（可选置顶） -->
+              <el-dialog v-model="commentDialogVisible" title="发布评论" width="480px" :close-on-click-modal="false" append-to-body>
+                <div class="comment-dialog-body">
+                  <el-input
+                    v-model="commentContent"
+                    type="textarea"
+                    :rows="4"
+                    maxlength="500"
+                    show-word-limit
+                    placeholder="输入要发布的评论内容（将以该账号身份发布到作品评论区）"
+                  />
+                  <el-checkbox v-if="commentCaps.supports_pin_comment" v-model="commentPinned" class="comment-pin-check">
+                    发布后置顶该评论
+                  </el-checkbox>
+                  <div v-if="!commentCaps.supports_comment" class="comment-unsupported">
+                    当前平台暂未支持评论功能（首期支持 B站）
+                  </div>
+                </div>
+                <template #footer>
+                  <el-button @click="commentDialogVisible = false">取消</el-button>
+                  <el-button type="primary" :loading="commentPosting" :disabled="!commentContent.trim()" @click="submitComment">
+                    {{ commentPosting ? '发布中…' : '发送' }}
+                  </el-button>
+                </template>
+              </el-dialog>
             </section>
             </div>
 
@@ -237,7 +267,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { ArrowLeft, WarningFilled, DocumentRemove, CircleCloseFilled, Picture, Timer, Refresh, CaretTop, ChatDotRound } from '@element-plus/icons-vue'
 import { useAccountStore } from '@/stores/account'
 import { accountApi } from '@/api/account'
-import { historyApi, taskApi, worksApi } from '@/api/v2'
+import { historyApi, taskApi, worksApi, commentsApi } from '@/api/v2'
 import { platformList, getPlatformByKey } from '@/config/platforms'
 import AccountSidebar from '@/components/AccountSidebar.vue'
 import PublishStats from '@/components/PublishStats.vue'
@@ -439,102 +469,150 @@ function formatSyncedAt(iso) {
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-// ===== 评论区（演示数据：后端评论同步接口就绪后整体替换为真实数据）=====
+// ===== 评论区（真实数据：后端评论同步 work_comments 表 + 浏览器自动化发评）=====
 const commentSort = ref('hot')          // 'hot' 最热（按点赞）| 'new' 最新（按时间）
 const expandedReplies = reactive(new Set())  // 已展开楼中楼的评论 id
 
-const mockComments = [
-  {
-    id: 'c1',
-    author: '山间清风',
-    time: '3小时前', location: '广东',
-    like_count: 342, reply_count: 12, ts: 3,
-    content: '老师讲得真好！孩子听完主动背了一遍《杨氏之子》，这就是经典的力量👍',
-    replies: [
-      { id: 'c1r1', author: '小言爱听歌A', isAuthor: true, time: '2小时前', location: '湖南', like_count: 56, content: '谢谢支持！孩子喜欢就是最大的动力，后续还会更新～' },
-      { id: 'c1r2', author: '柠檬不萌', time: '1小时前', location: '福建', like_count: 18, content: '同感！我家娃现在每天早晨都要听一遍' },
-    ],
-  },
-  {
-    id: 'c4',
-    author: '小言爱听歌A', isAuthor: true, pinned: true,
-    time: '6小时前', location: '湖南',
-    like_count: 76, reply_count: 3, ts: 6,
-    content: '感谢大家支持！后续会更新《世说新语》系列，记得关注不迷路～',
-    replies: [
-      { id: 'c4r1', author: '追风筝的人', time: '5小时前', location: '湖北', like_count: 12, content: '蹲一个系列！' },
-    ],
-  },
-  {
-    id: 'c2',
-    author: '阳光宅妈',
-    time: '5小时前', location: '浙江',
-    like_count: 156, reply_count: 4, ts: 5,
-    content: '已经三刷了，剪辑和文案都很用心，求出后续！',
-    replies: [],
-  },
-  {
-    id: 'c3',
-    author: '老王不慌',
-    time: '昨天 18:22', location: '四川',
-    like_count: 89, reply_count: 5, ts: 26,
-    content: '请问有配套的讲义吗？想给孩子系统学习一下',
-    replies: [
-      { id: 'c3r1', author: '小言爱听歌A', isAuthor: true, time: '昨天 20:05', location: '湖南', like_count: 31, content: '讲义整理好后会放到置顶评论，敬请期待' },
-      { id: 'c3r2', author: '深夜书虫', time: '昨天 21:40', location: '上海', like_count: 9, content: '帮顶，同样需要' },
-    ],
-  },
-  {
-    id: 'c5',
-    author: '江南烟雨',
-    time: '2天前', location: '北京',
-    like_count: 45, reply_count: 2, ts: 50,
-    content: '背景音乐叫什么呀，很好听',
-    replies: [
-      { id: 'c5r1', author: '木子李', time: '2天前', location: '陕西', like_count: 22, content: '是《广陵散》的古琴版，视频简介里有标注' },
-    ],
-  },
-  {
-    id: 'c6',
-    author: '北巷不夏',
-    time: '2天前', location: '江苏',
-    like_count: 23, reply_count: 0, ts: 55,
-    content: '画质真清晰，用的什么设备拍的？',
-    replies: [],
-  },
-  {
-    id: 'c7',
-    author: '追风筝的人',
-    time: '3天前', location: '湖南',
-    like_count: 18, reply_count: 1, ts: 74,
-    content: '孩子看了两遍，还问了我好多春秋时期的问题，哈哈',
-    replies: [
-      { id: 'c7r1', author: '山间清风', time: '3天前', location: '广东', like_count: 8, content: '兴趣才是最好的老师～' },
-    ],
-  },
-  {
-    id: 'c8',
-    author: '岁月静好',
-    time: '3天前', location: '山东',
-    like_count: 9, reply_count: 0, ts: 80,
-    content: '收藏了，周末全家一起看',
-    replies: [],
-  },
-]
+const comments = ref([])                // 后端 work_comments 的前端投影
+const commentsCaps = ref({ supports_comment: false, supports_pin_comment: false })
+const commentsLoading = ref(false)
+const commentsSyncing = ref(false)
+let commentsTimer = null
+
+// 当前明细是否可用评论功能：平台支持 + 明细发布成功
+const commentDisabled = computed(() => {
+  return !selectedItem.value || selectedItem.value.status !== 'success'
+})
+
+async function fetchComments() {
+  const detailId = selectedItem.value?.id
+  if (!detailId) return
+  commentsLoading.value = true
+  try {
+    const res = await commentsApi.list(detailId)
+    commentsCaps.value = {
+      supports_comment: !!res?.data?.supports_comment,
+      supports_pin_comment: !!res?.data?.supports_pin_comment,
+    }
+    comments.value = res?.data?.items || []
+  } catch (e) {
+    comments.value = []
+  } finally {
+    commentsLoading.value = false
+  }
+}
+
+// 切换选中账号 / 重新拉取批次详情时，重新加载该明细的评论
+watch(() => selectedItem.value?.id, (id) => {
+  comments.value = []
+  if (commentsTimer) { clearInterval(commentsTimer); commentsTimer = null }
+  if (id) fetchComments()
+})
+
+// 轮询评论任务（发评/同步都要开浏览器，30~90s）：每 3s 一次，最多 60 次（3 分钟）
+function pollCommentTask(taskId, onDone) {
+  let polls = 0
+  clearInterval(commentsTimer)
+  commentsTimer = setInterval(async () => {
+    polls += 1
+    let st = null
+    try {
+      const res = await commentsApi.taskStatus(taskId)
+      st = res?.data
+    } catch { /* 网络抖动不中断轮询 */ }
+    if (st && st.status === 'done') {
+      clearInterval(commentsTimer)
+      commentsTimer = null
+      await fetchComments()
+      onDone(null, st.result)
+    } else if (st && st.status === 'error') {
+      clearInterval(commentsTimer)
+      commentsTimer = null
+      onDone(st.error || '任务失败', null)
+    } else if (polls >= 60) {
+      clearInterval(commentsTimer)
+      commentsTimer = null
+      onDone('任务超时，请稍后刷新查看', null)
+    }
+  }, 3000)
+}
+
+// ===== 同步评论：浏览器自动化抓取评论区 → 落库 → 重新渲染 =====
+async function syncComments() {
+  const detailId = selectedItem.value?.id
+  if (!detailId || commentsSyncing.value) return
+  commentsSyncing.value = true
+  try {
+    const res = await commentsApi.sync(detailId)
+    const taskId = res?.data?.task_id
+    if (!taskId) throw new Error('未返回任务 ID')
+    pollCommentTask(taskId, (err) => {
+      commentsSyncing.value = false
+      if (err) ElMessage.error('同步失败: ' + err)
+      else ElMessage.success('评论同步完成')
+    })
+  } catch (e) {
+    commentsSyncing.value = false
+    ElMessage.error('触发同步失败: ' + (e?.message || e))
+  }
+}
+
+// ===== 一键评论：弹窗输入 → 浏览器自动化发评（可选置顶）=====
+const commentDialogVisible = ref(false)
+const commentContent = ref('')
+const commentPinned = ref(false)
+const commentPosting = ref(false)
+// 弹窗能力跟随当前明细平台（置顶选项仅支持平台显示）
+const commentCaps = computed(() => commentsCaps.value)
+
+function openCommentDialog() {
+  if (!selectedItem.value) return
+  if (!commentsCaps.value.supports_comment) {
+    ElMessage.info('当前平台暂未支持评论功能（首期支持 B站）')
+  }
+  commentContent.value = ''
+  commentPinned.value = false
+  commentDialogVisible.value = true
+}
+
+async function submitComment() {
+  const detailId = selectedItem.value?.id
+  const content = commentContent.value.trim()
+  if (!detailId || !content || commentPosting.value) return
+  commentPosting.value = true
+  try {
+    const res = await commentsApi.post(detailId, content, commentPinned.value)
+    const taskId = res?.data?.task_id
+    if (!taskId) throw new Error('未返回任务 ID')
+    pollCommentTask(taskId, (err, result) => {
+      commentPosting.value = false
+      if (err) {
+        ElMessage.error('发布失败: ' + err)
+        return
+      }
+      commentDialogVisible.value = false
+      if (result?.message) ElMessage.warning(result.message)
+      else ElMessage.success(commentPinned.value ? '评论已发布并置顶' : '评论已发布')
+    })
+  } catch (e) {
+    commentPosting.value = false
+    ElMessage.error('触发发布失败: ' + (e?.message || e))
+  }
+}
 
 // 总评论数 = 顶级评论 + 各评论的回复数（与后端同步后的接口口径一致）
 const commentTotal = computed(() =>
-  mockComments.reduce((sum, c) => sum + 1 + (c.reply_count || 0), 0)
+  comments.value.reduce((sum, c) => sum + 1 + (c.reply_count || 0), 0)
 )
 
 // 排序：置顶恒在最前；最热按点赞降序、最新按时间升序
 const displayComments = computed(() => {
-  const list = [...mockComments]
+  const list = [...comments.value]
   const pin = c => Number(!!c.pinned)
   if (commentSort.value === 'hot') {
     list.sort((a, b) => pin(b) - pin(a) || b.like_count - a.like_count)
   } else {
-    list.sort((a, b) => pin(b) - pin(a) || a.ts - b.ts)
+    list.sort((a, b) => pin(b) - pin(a) || (a.ts || 0) - (b.ts || 0))
   }
   return list
 })
@@ -560,11 +638,6 @@ function toggleReplies(c) {
 const avatarColors = ['#8b5cf6', '#3b82f6', '#f43f5e', '#06b6d4', '#22c55e', '#f59e0b']
 function avatarColor(i) {
   return avatarColors[i % avatarColors.length]
-}
-
-function syncComments() {
-  // TODO: 接入后端评论同步接口（works 页评论抓取）
-  ElMessage.info('评论同步功能开发中，敬请期待')
 }
 
 function toggleGroup(key) {
@@ -633,6 +706,7 @@ watch(batchActive, (active) => {
 onBeforeUnmount(() => {
   if (pollTimer) { clearInterval(pollTimer); pollTimer = null }
   if (syncTimer) { clearInterval(syncTimer); syncTimer = null }
+  if (commentsTimer) { clearInterval(commentsTimer); commentsTimer = null }
 })
 
 onMounted(async () => {
@@ -1085,14 +1159,12 @@ onMounted(async () => {
   border-radius: 10px;
 }
 
-// 「演示数据」标记（评论同步接入后移除）
-.mock-chip {
-  font-size: 11px;
-  font-weight: 400;
+// 评论列表空态 / 加载中
+.comments-empty {
+  padding: 40px 0;
+  text-align: center;
+  font-size: 13px;
   color: $text-muted;
-  border: 1px dashed $border;
-  padding: 1px 8px;
-  border-radius: 10px;
 }
 
 .comments-toolbar {
@@ -1337,6 +1409,20 @@ onMounted(async () => {
       font-weight: 400;
       color: $text-muted;
     }
+  }
+}
+</style>
+
+<style lang="scss">
+/* 一键评论弹窗（append-to-body 传送门内容，scoped 作用域覆盖不到，需全局） */
+.comment-dialog-body {
+  .comment-pin-check {
+    margin-top: 12px;
+  }
+  .comment-unsupported {
+    margin-top: 12px;
+    font-size: 12px;
+    color: #f59e0b;
   }
 }
 </style>

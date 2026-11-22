@@ -768,6 +768,53 @@ def works_sync_status():
     return jsonify({"code": 200, "data": get_sync_status()})
 
 
+# ========== 作品评论（一键评论 / 评论同步） ==========
+
+@ext_api.route('/works/<detail_id>/comments', methods=['GET'])
+def get_work_comments(detail_id):
+    """读取某明细已同步的评论 + 平台评论能力标记。
+
+    Response 200: {"code": 200, "data": {supports_comment,
+                   supports_pin_comment, items: [...], total}}
+    """
+    from services.comments import list_comments as svc_list
+    return jsonify({"code": 200, "data": svc_list(detail_id)})
+
+
+@ext_api.route('/works/<detail_id>/comments', methods=['POST'])
+def post_work_comment(detail_id):
+    """一键评论：浏览器自动化跳作品页发评（可选置顶），异步执行。
+
+    Body: {"content": str, "pinned": bool}
+    Response 200: {"code": 200, "data": {"task_id": str}}
+    Response 400: content 为空
+    """
+    from services.comments import start_post_comment
+    data = request.get_json(silent=True) or {}
+    content = (data.get('content') or '').strip()
+    if not content:
+        return jsonify({"code": 400, "msg": "评论内容不能为空"}), 400
+    task_id = start_post_comment(detail_id, content, bool(data.get('pinned')))
+    return jsonify({"code": 200, "data": {"task_id": task_id}})
+
+
+@ext_api.route('/works/<detail_id>/comments/sync', methods=['POST'])
+def sync_work_comments(detail_id):
+    """评论同步：浏览器自动化抓取作品评论区并落库，异步执行。
+
+    Response 200: {"code": 200, "data": {"task_id": str}}
+    """
+    from services.comments import start_sync_comments
+    return jsonify({"code": 200, "data": {"task_id": start_sync_comments(detail_id)}})
+
+
+@ext_api.route('/works/comments/tasks/<task_id>', methods=['GET'])
+def get_comment_task(task_id):
+    """评论任务状态轮询：{status: running|done|error, result, error}。"""
+    from services.comments import get_task as svc_get_task
+    return jsonify({"code": 200, "data": svc_get_task(task_id)})
+
+
 # ========== 统计数据 ==========
 
 @ext_api.route('/stats', methods=['GET'])

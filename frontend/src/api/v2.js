@@ -63,6 +63,26 @@ export const worksApi = {
   },
 }
 
+// 作品评论（一键评论 / 评论同步）
+export const commentsApi = {
+  // 读取已同步评论 + 平台能力: { supports_comment, supports_pin_comment, items, total }
+  list(detailId) {
+    return http.get(`/api/v2/works/${detailId}/comments`)
+  },
+  // 一键评论（浏览器自动化，异步）: { content, pinned } → { task_id }
+  post(detailId, content, pinned = false) {
+    return http.post(`/api/v2/works/${detailId}/comments`, { content, pinned })
+  },
+  // 评论同步（浏览器自动化抓取评论区，异步）→ { task_id }
+  sync(detailId) {
+    return http.post(`/api/v2/works/${detailId}/comments/sync`)
+  },
+  // 任务状态轮询: { status: running|done|error, result, error }
+  taskStatus(taskId) {
+    return http.get(`/api/v2/works/comments/tasks/${taskId}`)
+  },
+}
+
 // 统计数据
 export const statsApi = {
   getStats() {

@@ -2218,3 +2218,247 @@ class BilibiliPlatform(BasePlatform):
                 await browser.close()
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # 作品评论（一键评论 / 评论同步）
+    # ------------------------------------------------------------------
+
+    supports_comment = True
+    supports_pin_comment = True
+
+    async def _comment_page(self, cookie_file: str):
+        """打开已登录的创作中心页（与 api.bilibili.com 共享 SSO cookie），
+        返回 (browser, context, page)。调用方负责三层关闭。"""
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        context = await self.create_context(browser, storage_state=cookie_path)
+        page = await context.new_page()
+        await page.goto(BILIBILI_MANAGE_URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(2)
+        if "passport.bilibili.com" in page.url:
+            raise RuntimeError("cookie 失效（跳转到登录页）")
+        return browser, context, page
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """抓取视频评论区：页内 fetch /x/v2/reply/main（无签名，仅需 cookie）。
+
+        work_id 支持 BV 号或纯 aid 数字。评论接口需要 aid，先经
+        /x/web-interface/view?bvid= 换取。楼中楼拉一级子评论（replies 字段）。
+        """
+        bvid = work_id.strip()
+        if not bvid:
+            return []
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+
+            # BV → aid（已是纯数字则直接当 aid 用）
+            aid_js = """
+                async (bvid) => {
+                    if (/^\\d+$/.test(bvid)) return { code: 0, aid: bvid };
+                    const resp = await fetch(
+                        'https://api.bilibili.com/x/web-interface/view?bvid=' + bvid,
+                        { credentials: 'include' });
+                    const j = await resp.json();
+                    if (j.code !== 0) return j;
+                    return { code: 0, aid: String(j.data.aid), title: j.data.title,
+                             owner_mid: j.data.owner ? j.data.owner.mid : null };
+                }
+            """
+            meta = await page.evaluate(aid_js, bvid)
+            if not isinstance(meta, dict) or meta.get("code") != 0:
+                logger.info(f"[bilibili list_comments] 取 aid 失败: {meta}")
+                return []
+            aid = str(meta["aid"])
+            owner_mid = meta.get("owner_mid")
+
+            # 顶层评论翻页 + 单独取置顶评论（data.top.upper 不在 replies 里）
+            fetch_js = """
+                async ([aid, ps]) => {
+                    const topResp = await fetch(
+                        'https://api.bilibili.com/x/v2/reply/main?type=1&oid=' + aid,
+                        { credentials: 'include' });
+                    const top = await topResp.json();
+                    const topUpper = top?.data?.top?.upper
+                        ? { rpid: String(top.data.top.upper.rpid) }
+                        : null;
+                    const out = [];
+                    let next = 0;
+                    for (let i = 0; i < 10; i++) {
+                        const url = 'https://api.bilibili.com/x/v2/reply/main?type=1&oid=' + aid
+                            + '&next=' + next + '&ps=' + ps;
+                        const resp = await fetch(url, { credentials: 'include' });
+                        const j = await resp.json();
+                        if (j.code !== 0) return { code: j.code, message: j.message, replies: out, top: topUpper };
+                        const replies = j.data?.replies || [];
+                        for (const r of replies) {
+                            out.push({
+                                rpid: String(r.rpid),
+                                author: r.member?.uname || '',
+                                avatar: r.member?.avatar || '',
+                                content: r.content?.message || '',
+                                like: r.like || 0,
+                                rcount: r.rcount || 0,
+                                ctime: r.ctime || 0,
+                                location: (r.reply_control?.location || '').replace(/^IP属地：/, ''),
+                                mid: r.member?.mid || '',
+                                children: (r.replies || []).map(c => ({
+                                    rpid: String(c.rpid),
+                                    author: c.member?.uname || '',
+                                    avatar: c.member?.avatar || '',
+                                    content: c.content?.message || '',
+                                    like: c.like || 0,
+                                    ctime: c.ctime || 0,
+                                    location: (c.reply_control?.location || '').replace(/^IP属地：/, ''),
+                                    mid: c.member?.mid || '',
+                                })),
+                            });
+                        }
+                        const cursor = j.data?.cursor;
+                        const isEnd = cursor ? (cursor.is_end || !cursor.next) : true;
+                        if (isEnd || !replies.length) break;
+                        next = cursor.next;
+                    }
+                    return { code: 0, replies: out, top: topUpper };
+                }
+            """
+            result = await page.evaluate(fetch_js, [aid, 20])
+            if not isinstance(result, dict) or result.get("code") != 0:
+                logger.info(f"[bilibili list_comments] 拉取评论失败: {result}")
+                return []
+
+            owner_mid_s = str(owner_mid) if owner_mid else ""
+            comments: list[dict] = []
+            top_rpid = (result.get("top") or {}).get("rpid", "")
+
+            def _fmt(ts):
+                if not ts:
+                    return ""
+                from datetime import datetime, timezone, timedelta
+                return datetime.fromtimestamp(
+                    int(ts), tz=timezone(timedelta(hours=8))
+                ).strftime("%Y-%m-%d %H:%M")
+
+            for r in result.get("replies", []):
+                is_author = bool(owner_mid_s) and str(r.get("mid") or "") == owner_mid_s
+                comments.append({
+                    "comment_id": r["rpid"],
+                    "parent_id": "",
+                    "author": r.get("author") or "",
+                    "avatar": r.get("avatar") or "",
+                    "content": r.get("content") or "",
+                    "like_count": int(r.get("like") or 0),
+                    "reply_count": int(r.get("rcount") or 0),
+                    "publish_time": _fmt(r.get("ctime")),
+                    "location": r.get("location") or "",
+                    "is_author": is_author,
+                    "pinned": bool(top_rpid) and r["rpid"] == top_rpid,
+                })
+                for c in r.get("children") or []:
+                    comments.append({
+                        "comment_id": c["rpid"],
+                        "parent_id": r["rpid"],
+                        "author": c.get("author") or "",
+                        "avatar": c.get("avatar") or "",
+                        "content": c.get("content") or "",
+                        "like_count": int(c.get("like") or 0),
+                        "reply_count": 0,
+                        "publish_time": _fmt(c.get("ctime")),
+                        "location": c.get("location") or "",
+                        "is_author": bool(owner_mid_s) and str(c.get("mid") or "") == owner_mid_s,
+                        "pinned": False,
+                    })
+            logger.info(f"[bilibili list_comments] {bvid} 抓到 {len(comments)} 条评论")
+            return comments
+        except Exception as e:
+            logger.info(f"[bilibili list_comments] 抓取失败: {e}")
+            return []
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """页内 fetch 发评（/x/v2/reply/add，type=1，csrf 取 bili_jct），
+        成功后按需置顶（/x/v2/reply/top action=top）。"""
+        bvid = work_id.strip()
+        if not bvid or not (content or "").strip():
+            return {"ok": False, "message": "参数缺失（work_id / content）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            result = await page.evaluate(
+                """
+                async ([bvid, content, pinned]) => {
+                    const viewResp = await fetch(
+                        'https://api.bilibili.com/x/web-interface/view?bvid=' + bvid,
+                        { credentials: 'include' });
+                    const view = await viewResp.json();
+                    if (view.code !== 0) return { ok: false, message: '取稿件信息失败: ' + view.message };
+                    const aid = view.data.aid;
+                    const csrf = (document.cookie.match(/bili_jct=([^;]+)/) || [])[1] || '';
+                    if (!csrf) return { ok: false, message: 'cookie 中无 bili_jct（csrf）' };
+
+                    const body = new URLSearchParams({
+                        oid: String(aid), type: '1', message: content,
+                        plat: '1', web_location: '1315875', csrf: csrf, csrf_token: csrf,
+                    });
+                    const addResp = await fetch('https://api.bilibili.com/x/v2/reply/add', {
+                        method: 'POST', credentials: 'include',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString(),
+                    });
+                    const add = await addResp.json();
+                    if (add.code !== 0) return { ok: false, message: '发评失败: ' + (add.message || add.code) };
+                    const rpid = String(add.data?.rpid || '');
+
+                    if (pinned && rpid) {
+                        // 置顶契约（bilibili-API-collect comment/action.md）：
+                        // body 传 rpid + action=1（数字），不是 rpyid/action=top
+                        const topBody = new URLSearchParams({
+                            oid: String(aid), type: '1', rpid: rpid,
+                            action: '1', csrf: csrf, csrf_token: csrf,
+                        });
+                        const topResp = await fetch('https://api.bilibili.com/x/v2/reply/top', {
+                            method: 'POST', credentials: 'include',
+                            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                            body: topBody.toString(),
+                        });
+                        const top = await topResp.json();
+                        if (top.code !== 0) {
+                            return { ok: true, comment_id: rpid,
+                                     message: '评论已发布，但置顶失败: ' + (top.message || top.code) };
+                        }
+                    }
+                    return { ok: true, comment_id: rpid, message: '' };
+                }
+                """,
+                [bvid, content.strip(), bool(pinned)],
+            )
+            if not isinstance(result, dict) or not result.get("ok"):
+                msg = (result or {}).get("message", "未知错误") if isinstance(result, dict) else str(result)
+                logger.info(f"[bilibili post_comment] {bvid} 失败: {msg}")
+                return {"ok": False, "message": msg}
+            logger.info(
+                f"[bilibili post_comment] {bvid} 发布成功 rpid={result.get('comment_id')} pinned={pinned}"
+            )
+            return {
+                "ok": True,
+                "comment_id": result.get("comment_id") or "",
+                "message": result.get("message") or "",
+            }
+        except Exception as e:
+            logger.info(f"[bilibili post_comment] 发布失败: {e}")
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass

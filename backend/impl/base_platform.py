@@ -428,3 +428,47 @@ class BasePlatform(ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support listing works"
         )
+
+    # ------------------------------------------------------------------
+    # 作品评论（一键评论 / 评论同步）
+    # ------------------------------------------------------------------
+
+    # 平台是否支持「作者发评 + 置顶」：前端据此显示/隐藏置顶选项
+    supports_comment = False
+    supports_pin_comment = False
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """抓取作品评论区（含楼中楼），按平台默认排序。
+
+        返回 dict 字段约定：
+          comment_id   str   平台评论唯一 ID
+          parent_id    str   楼中楼父评论 ID（顶级为空串）
+          author       str   评论者昵称
+          avatar       str   头像 URL（拿不到为空串）
+          content      str   评论内容
+          like_count   int   点赞数
+          reply_count  int   回复数（顶级评论）
+          publish_time str   平台展示时间文本
+          location     str   IP 归属地（拿不到为空串）
+          is_author    bool  是否作者本人（UP主/自己）
+          pinned       bool  是否置顶
+        cookie 失效 / 抓取失败 → 返回 []（不抛异常）。
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support listing comments"
+        )
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """以作者身份在作品下发布一条评论。
+
+        返回 {"ok": bool, "comment_id": str, "message": str}。
+        pinned=True 且平台支持时，发布成功后置顶该评论。
+        失败 → {"ok": False, "message": 原因}（不抛异常）。
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support posting comments"
+        )
