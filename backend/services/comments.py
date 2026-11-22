@@ -129,7 +129,108 @@ def _upsert_comment_row(detail: dict, c: dict, conn=None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 一键评论
+# 单明细执行核心（单条任务与批量任务共用）
+# ---------------------------------------------------------------------------
+
+def _post_one_detail(detail: dict, content: str, pinned: bool, tag: str) -> dict:
+    """对单个明细执行发评，返回该明细的结果摘要（不抛异常）。"""
+    base = {
+        "detail_id": detail["id"],
+        "account_name": detail.get("account_name") or "",
+        "platform_id": detail.get("platform_id"),
+    }
+    platform_id = detail.get("platform_id")
+    cookie_file = (detail.get("cookie_file") or "").strip()
+    if not platform_id or not cookie_file:
+        return {**base, "ok": False, "message": "账号不存在或 cookie 配置缺失"}
+    work_id = _resolve_work_id(detail)
+    if not work_id:
+        return {**base, "ok": False, "message": "未找到作品 ID（请先执行「重新关联」回填作品链接）"}
+
+    detail["work_id"] = work_id
+    ok, result = _call_platform(
+        platform_id, cookie_file, "post_comment",
+        work_id=work_id, content=content, pinned=pinned,
+    )
+    if not ok:
+        return {**base, "ok": False, "message": result.get("message") or "调用失败"}
+    if not result.get("ok"):
+        return {**base, "ok": False, "message": result.get("message") or "发评失败"}
+
+    # 自己的评论落库（置顶标记以平台实际返回为准）
+    pinned_ok = bool(result.get("pinned"))
+    try:
+        _upsert_comment_row(detail, {
+            "comment_id": result.get("comment_id") or f"local-{tag[:8]}",
+            "parent_id": "", "author": detail.get("account_name") or "",
+            "avatar": "", "content": content,
+            "like_count": 0, "reply_count": 0,
+            "publish_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "location": "", "is_author": True,
+            "pinned": pinned_ok,
+        })
+    except Exception as exc:
+        logger.warning("[Comments] 自己的评论落库失败(不影响结果): %s", exc)
+
+    logger.info(
+        "[Comments] 发评完成 detail=%s work=%s pinned_ok=%s",
+        detail["id"], work_id, pinned_ok,
+    )
+    return {
+        **base, "ok": True,
+        "comment_id": result.get("comment_id") or "",
+        "pinned": pinned_ok,
+        "message": result.get("message") or ("评论已发布并置顶" if pinned_ok else "评论已发布"),
+    }
+
+
+def _sync_one_detail(detail: dict) -> dict:
+    """对单个明细执行评论同步（抓取 + 整明细替换落库），返回结果摘要。"""
+    base = {
+        "detail_id": detail["id"],
+        "account_name": detail.get("account_name") or "",
+        "platform_id": detail.get("platform_id"),
+    }
+    platform_id = detail.get("platform_id")
+    cookie_file = (detail.get("cookie_file") or "").strip()
+    if not platform_id or not cookie_file:
+        return {**base, "ok": False, "message": "账号不存在或 cookie 配置缺失"}
+    work_id = _resolve_work_id(detail)
+    if not work_id:
+        return {**base, "ok": False, "message": "未找到作品 ID（请先执行「重新关联」回填作品链接）"}
+
+    detail["work_id"] = work_id
+    ok, comments = _call_platform(
+        platform_id, cookie_file, "list_comments", work_id=work_id
+    )
+    if not ok:
+        return {**base, "ok": False, "message": comments.get("message") or "调用失败"}
+    if not comments:
+        return {**base, "ok": False, "message": "评论区抓取失败（cookie 可能已失效）"}
+
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            # 整明细替换：先删旧数据（平台上已删除的评论不再残留），再插入本轮快照
+            # （delete + 全部 upsert 共用同一连接同一事务，避免自锁）
+            conn.execute("DELETE FROM work_comments WHERE detail_id = ?", (detail["id"],))
+            for c in comments:
+                _upsert_comment_row(detail, c, conn)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        return {**base, "ok": False, "message": f"评论落库失败: {exc}"}
+
+    logger.info(
+        "[Comments] 评论同步完成 detail=%s work=%s count=%d",
+        detail["id"], work_id, len(comments),
+    )
+    return {**base, "ok": True, "count": len(comments), "message": f"同步 {len(comments)} 条评论"}
+
+
+# ---------------------------------------------------------------------------
+# 一键评论（单明细）
 # ---------------------------------------------------------------------------
 
 def start_post_comment(detail_id: str, content: str, pinned: bool) -> str:
@@ -155,59 +256,21 @@ def _run_post(task_id: str, detail_id: str, content: str, pinned: bool) -> None:
     if detail.get("status") != "success":
         _finish_error(task_id, "该明细未发布成功，无法评论")
         return
-    platform_id = detail.get("platform_id")
-    cookie_file = (detail.get("cookie_file") or "").strip()
-    if not platform_id or not cookie_file:
-        _finish_error(task_id, "账号不存在或 cookie 配置缺失")
-        return
-    work_id = _resolve_work_id(detail)
-    if not work_id:
-        _finish_error(task_id, "未找到作品 ID（请先执行「重新关联」回填作品链接）")
-        return
 
-    detail["work_id"] = work_id
-    ok, result = _call_platform(
-        platform_id, cookie_file, "post_comment",
-        work_id=work_id, content=content, pinned=pinned,
-    )
-    if not ok:
-        _finish_error(task_id, result.get("message") or "调用失败")
-        return
-    if not result.get("ok"):
+    r = _post_one_detail(detail, content, bool(pinned), task_id)
+    if not r["ok"]:
         with _tasks_lock:
-            _tasks[task_id].update(status="error", error=result.get("message") or "发评失败")
+            _tasks[task_id].update(status="error", error=r["message"])
         return
-
-    # 自己的评论落库（置顶标记以平台实际返回为准）
-    pinned_ok = bool(result.get("pinned"))
-    try:
-        _upsert_comment_row(detail, {
-            "comment_id": result.get("comment_id") or f"local-{task_id[:8]}",
-            "parent_id": "", "author": detail.get("account_name") or "",
-            "avatar": "", "content": content,
-            "like_count": 0, "reply_count": 0,
-            "publish_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "location": "", "is_author": True,
-            "pinned": pinned_ok,
-        })
-    except Exception as exc:
-        logger.warning("[Comments] 自己的评论落库失败(不影响结果): %s", exc)
-
     with _tasks_lock:
         _tasks[task_id].update(status="done", result={
-            "ok": True,
-            "comment_id": result.get("comment_id") or "",
-            "pinned": pinned_ok,
-            "message": result.get("message") or ("评论已发布并置顶" if pinned_ok else "评论已发布"),
+            "ok": True, "comment_id": r.get("comment_id") or "",
+            "pinned": bool(r.get("pinned")), "message": r["message"],
         })
-    logger.info(
-        "[Comments] 发评完成 detail=%s work=%s pinned_ok=%s",
-        detail_id, work_id, pinned_ok,
-    )
 
 
 # ---------------------------------------------------------------------------
-# 评论同步
+# 评论同步（单明细）
 # ---------------------------------------------------------------------------
 
 def start_sync_comments(detail_id: str) -> str:
@@ -230,45 +293,120 @@ def _run_sync(task_id: str, detail_id: str) -> None:
     if not detail:
         _finish_error(task_id, "发布明细不存在")
         return
-    platform_id = detail.get("platform_id")
-    cookie_file = (detail.get("cookie_file") or "").strip()
-    if not platform_id or not cookie_file:
-        _finish_error(task_id, "账号不存在或 cookie 配置缺失")
-        return
-    work_id = _resolve_work_id(detail)
-    if not work_id:
-        _finish_error(task_id, "未找到作品 ID（请先执行「重新关联」回填作品链接）")
-        return
 
-    detail["work_id"] = work_id
-    ok, comments = _call_platform(
-        platform_id, cookie_file, "list_comments", work_id=work_id
-    )
-    if not ok:
-        _finish_error(task_id, comments.get("message") or "调用失败")
+    r = _sync_one_detail(detail)
+    if not r["ok"]:
+        _finish_error(task_id, r["message"])
         return
-    if not comments:
-        _finish_error(task_id, "评论区抓取失败（cookie 可能已失效）")
-        return
-
-    try:
-        conn = sqlite3.connect(str(DB_PATH))
-        try:
-            # 整明细替换：先删旧数据（平台上已删除的评论不再残留），再插入本轮快照
-            # （delete + 全部 upsert 共用同一连接同一事务，避免自锁）
-            conn.execute("DELETE FROM work_comments WHERE detail_id = ?", (detail_id,))
-            for c in comments:
-                _upsert_comment_row(detail, c, conn)
-            conn.commit()
-        finally:
-            conn.close()
-    except Exception as exc:
-        _finish_error(task_id, f"评论落库失败: {exc}")
-        return
-
     with _tasks_lock:
-        _tasks[task_id].update(status="done", result={"ok": True, "count": len(comments)})
-    logger.info("[Comments] 评论同步完成 detail=%s work=%s count=%d", detail_id, work_id, len(comments))
+        _tasks[task_id].update(status="done", result={"ok": True, "count": r["count"]})
+
+
+# ---------------------------------------------------------------------------
+# 批量执行（批次内全部 success 明细，串行跑浏览器）
+# ---------------------------------------------------------------------------
+
+_BATCH_SELECT = """
+    SELECT d.id, d.batch_id, d.account_id, d.account_name,
+           d.work_id, d.publish_url, d.status,
+           u.type AS platform_id, u.filePath AS cookie_file
+    FROM publish_details d
+    LEFT JOIN user_info u ON d.account_id = u.id
+    WHERE d.batch_id = ? AND d.status = 'success'
+    ORDER BY d.created_at ASC
+"""
+
+
+def _load_batch_details(batch_id: str) -> list[dict]:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(_BATCH_SELECT, (batch_id,)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def start_post_comment_batch(batch_id: str, content: str, pinned: bool) -> str:
+    """批次级一键评论：批次内全部 success 明细逐个发评，返回 task_id。
+
+    浏览器自动化串行执行（避免多浏览器并发争抢），任务带 progress 进度。
+    """
+    task_id = str(uuid.uuid4())
+    with _tasks_lock:
+        _tasks[task_id] = {
+            "status": "running", "kind": "post-batch", "batch_id": batch_id,
+            "result": None, "error": "",
+            "progress": {"done": 0, "total": 0},
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    threading.Thread(
+        target=_run_batch, args=(task_id, batch_id, "post", content, bool(pinned)),
+        daemon=True, name=f"comment-postbatch-{task_id[:8]}",
+    ).start()
+    return task_id
+
+
+def start_sync_comments_batch(batch_id: str) -> str:
+    """批次级评论同步：批次内全部 success 明细逐个抓取，返回 task_id。"""
+    task_id = str(uuid.uuid4())
+    with _tasks_lock:
+        _tasks[task_id] = {
+            "status": "running", "kind": "sync-batch", "batch_id": batch_id,
+            "result": None, "error": "",
+            "progress": {"done": 0, "total": 0},
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    threading.Thread(
+        target=_run_batch, args=(task_id, batch_id, "sync", None, False),
+        daemon=True, name=f"comment-syncbatch-{task_id[:8]}",
+    ).start()
+    return task_id
+
+
+def _run_batch(task_id: str, batch_id: str, kind: str,
+               content: str | None, pinned: bool) -> None:
+    details = _load_batch_details(batch_id)
+    if not details:
+        _finish_error(task_id, "该批次没有发布成功的明细")
+        return
+    total = len(details)
+    results: list[dict] = []
+    for i, detail in enumerate(details):
+        with _tasks_lock:
+            _tasks[task_id]["progress"] = {"done": i, "total": total}
+        try:
+            if kind == "post":
+                r = _post_one_detail(detail, content or "", pinned, task_id)
+            else:
+                r = _sync_one_detail(detail)
+        except Exception as exc:
+            logger.warning("[Comments] 批量项执行异常 detail=%s: %s", detail["id"], exc)
+            r = {
+                "detail_id": detail["id"],
+                "account_name": detail.get("account_name") or "",
+                "platform_id": detail.get("platform_id"),
+                "ok": False, "message": f"执行异常: {exc}",
+            }
+        results.append(r)
+        logger.info(
+            "[Comments] 批量%s进度 %d/%d detail=%s ok=%s",
+            "发评" if kind == "post" else "同步", i + 1, total,
+            detail["id"], r.get("ok"),
+        )
+
+    succeed = sum(1 for r in results if r.get("ok"))
+    with _tasks_lock:
+        _tasks[task_id].update(
+            status="done",
+            progress={"done": total, "total": total},
+            result={"ok": True, "results": results,
+                    "succeed": succeed, "total": total},
+        )
+    logger.info(
+        "[Comments] 批量%s完成 batch=%s 成功 %d/%d",
+        "发评" if kind == "post" else "同步", batch_id, succeed, total,
+    )
 
 
 # ---------------------------------------------------------------------------

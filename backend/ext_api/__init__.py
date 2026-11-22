@@ -808,6 +808,33 @@ def sync_work_comments(detail_id):
     return jsonify({"code": 200, "data": {"task_id": start_sync_comments(detail_id)}})
 
 
+@ext_api.route('/history/<batch_id>/comments', methods=['POST'])
+def post_batch_comments(batch_id):
+    """批次级一键评论：批次内全部 success 明细逐个发评（可选置顶），异步执行。
+
+    Body: {"content": str, "pinned": bool}
+    Response 200: {"code": 200, "data": {"task_id": str}}
+    Response 400: content 为空
+    """
+    from services.comments import start_post_comment_batch
+    data = request.get_json(silent=True) or {}
+    content = (data.get('content') or '').strip()
+    if not content:
+        return jsonify({"code": 400, "msg": "评论内容不能为空"}), 400
+    task_id = start_post_comment_batch(batch_id, content, bool(data.get('pinned')))
+    return jsonify({"code": 200, "data": {"task_id": task_id}})
+
+
+@ext_api.route('/history/<batch_id>/comments/sync', methods=['POST'])
+def sync_batch_comments(batch_id):
+    """批次级评论同步：批次内全部 success 明细逐个抓取评论区，异步执行。
+
+    Response 200: {"code": 200, "data": {"task_id": str}}
+    """
+    from services.comments import start_sync_comments_batch
+    return jsonify({"code": 200, "data": {"task_id": start_sync_comments_batch(batch_id)}})
+
+
 @ext_api.route('/works/comments/tasks/<task_id>', methods=['GET'])
 def get_comment_task(task_id):
     """评论任务状态轮询：{status: running|done|error, result, error}。"""

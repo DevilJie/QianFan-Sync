@@ -162,8 +162,12 @@
                     <button :class="{ active: commentSort === 'hot' }" @click="commentSort = 'hot'">最热</button>
                     <button :class="{ active: commentSort === 'new' }" @click="commentSort = 'new'">最新</button>
                   </div>
-                  <el-button size="small" :icon="ChatDotRound" :disabled="commentDisabled" @click="openCommentDialog">一键评论</el-button>
-                  <el-button size="small" :icon="Refresh" :loading="commentsSyncing" :disabled="commentDisabled" @click="syncComments">同步评论</el-button>
+                  <el-button size="small" :icon="ChatDotRound" :loading="commentPosting" :disabled="commentDisabled" @click="openCommentDialog">
+                    {{ commentPosting ? `一键评论 ${commentProgressText}` : '一键评论' }}
+                  </el-button>
+                  <el-button size="small" :icon="Refresh" :loading="commentsSyncing" :disabled="commentDisabled" @click="syncComments">
+                    {{ commentsSyncing ? `同步评论 ${commentProgressText}` : '同步评论' }}
+                  </el-button>
                 </div>
               </header>
 
@@ -479,10 +483,13 @@ const commentsLoading = ref(false)
 const commentsSyncing = ref(false)
 let commentsTimer = null
 
-// 当前明细是否可用评论功能：平台支持 + 明细发布成功
+// 当前批次是否可用评论功能：批次内至少一个明细发布成功
 const commentDisabled = computed(() => {
-  return !selectedItem.value || selectedItem.value.status !== 'success'
+  return !batch.value?.items?.some(it => it.status === 'success')
 })
+
+// 批量任务进度文本（如「2/3」）
+const commentProgressText = ref('')
 
 async function fetchComments() {
   const detailId = selectedItem.value?.id
@@ -509,9 +516,11 @@ watch(() => selectedItem.value?.id, (id) => {
   if (id) fetchComments()
 })
 
-// 轮询评论任务（发评/同步都要开浏览器，30~90s）：每 3s 一次，最多 60 次（3 分钟）
-function pollCommentTask(taskId, onDone) {
+// 轮询批量评论任务（每明细开浏览器 30~90s，N 个账号串行可能数分钟）：
+// 每 3s 一次，上限按明细数放大（每明细最多 20 次轮询）
+function pollCommentTask(taskId, total, onDone) {
   let polls = 0
+  const maxPolls = Math.max(60, total * 20)
   clearInterval(commentsTimer)
   commentsTimer = setInterval(async () => {
     polls += 1
@@ -520,6 +529,9 @@ function pollCommentTask(taskId, onDone) {
       const res = await commentsApi.taskStatus(taskId)
       st = res?.data
     } catch { /* 网络抖动不中断轮询 */ }
+    if (st?.progress && st.progress.total > 0) {
+      commentProgressText.value = `${st.progress.done}/${st.progress.total}`
+    }
     if (st && st.status === 'done') {
       clearInterval(commentsTimer)
       commentsTimer = null
@@ -529,7 +541,7 @@ function pollCommentTask(taskId, onDone) {
       clearInterval(commentsTimer)
       commentsTimer = null
       onDone(st.error || '任务失败', null)
-    } else if (polls >= 60) {
+    } else if (polls >= maxPolls) {
       clearInterval(commentsTimer)
       commentsTimer = null
       onDone('任务超时，请稍后刷新查看', null)
@@ -537,22 +549,38 @@ function pollCommentTask(taskId, onDone) {
   }, 3000)
 }
 
-// ===== 同步评论：浏览器自动化抓取评论区 → 落库 → 重新渲染 =====
+// 失败明细汇总文本（账号名: 原因）
+function summarizeFailures(results) {
+  const fails = (results || []).filter(r => !r.ok)
+  if (!fails.length) return ''
+  return fails.map(r => `${r.account_name || r.detail_id}（${r.message}）`).join('；')
+}
+
+// ===== 同步评论：批次内全部成功明细逐个抓取评论区 → 落库 → 重新渲染 =====
 async function syncComments() {
-  const detailId = selectedItem.value?.id
-  if (!detailId || commentsSyncing.value) return
+  const batchId = batch.value?.id
+  if (!batchId || commentsSyncing.value) return
   commentsSyncing.value = true
+  commentProgressText.value = ''
+  const total = batch.value.items.filter(it => it.status === 'success').length
   try {
-    const res = await commentsApi.sync(detailId)
+    const res = await commentsApi.syncBatch(batchId)
     const taskId = res?.data?.task_id
     if (!taskId) throw new Error('未返回任务 ID')
-    pollCommentTask(taskId, (err) => {
+    pollCommentTask(taskId, total, (err, result) => {
       commentsSyncing.value = false
-      if (err) ElMessage.error('同步失败: ' + err)
-      else ElMessage.success('评论同步完成')
+      commentProgressText.value = ''
+      if (err) {
+        ElMessage.error('同步失败: ' + err)
+        return
+      }
+      const failMsg = summarizeFailures(result?.results)
+      if (failMsg) ElMessage.warning(`同步完成 ${result.succeed}/${result.total}，失败：${failMsg}`)
+      else ElMessage.success(`评论同步完成（共 ${result.total} 个账号）`)
     })
   } catch (e) {
     commentsSyncing.value = false
+    commentProgressText.value = ''
     ElMessage.error('触发同步失败: ' + (e?.message || e))
   }
 }
@@ -566,9 +594,9 @@ const commentPosting = ref(false)
 const commentCaps = computed(() => commentsCaps.value)
 
 function openCommentDialog() {
-  if (!selectedItem.value) return
+  if (!batch.value) return
   if (!commentsCaps.value.supports_comment) {
-    ElMessage.info('当前平台暂未支持评论功能（首期支持 B站）')
+    ElMessage.info('当前选中平台暂未支持评论功能（首期支持 B站），不支持的账号将自动跳过')
   }
   commentContent.value = ''
   commentPinned.value = false
@@ -576,26 +604,31 @@ function openCommentDialog() {
 }
 
 async function submitComment() {
-  const detailId = selectedItem.value?.id
+  const batchId = batch.value?.id
   const content = commentContent.value.trim()
-  if (!detailId || !content || commentPosting.value) return
+  if (!batchId || !content || commentPosting.value) return
   commentPosting.value = true
+  commentProgressText.value = ''
+  const total = batch.value.items.filter(it => it.status === 'success').length
   try {
-    const res = await commentsApi.post(detailId, content, commentPinned.value)
+    const res = await commentsApi.postBatch(batchId, content, commentPinned.value)
     const taskId = res?.data?.task_id
     if (!taskId) throw new Error('未返回任务 ID')
-    pollCommentTask(taskId, (err, result) => {
+    pollCommentTask(taskId, total, (err, result) => {
       commentPosting.value = false
+      commentProgressText.value = ''
       if (err) {
         ElMessage.error('发布失败: ' + err)
         return
       }
       commentDialogVisible.value = false
-      if (result?.message) ElMessage.warning(result.message)
-      else ElMessage.success(commentPinned.value ? '评论已发布并置顶' : '评论已发布')
+      const failMsg = summarizeFailures(result?.results)
+      if (failMsg) ElMessage.warning(`发布完成 ${result.succeed}/${result.total}，失败：${failMsg}`)
+      else ElMessage.success(`评论已发布（共 ${result.total} 个账号${commentPinned.value ? '，已尝试置顶' : ''}）`)
     })
   } catch (e) {
     commentPosting.value = false
+    commentProgressText.value = ''
     ElMessage.error('触发发布失败: ' + (e?.message || e))
   }
 }

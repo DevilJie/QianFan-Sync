@@ -77,9 +77,17 @@ export const commentsApi = {
   sync(detailId) {
     return http.post(`/api/v2/works/${detailId}/comments/sync`)
   },
-  // 任务状态轮询: { status: running|done|error, result, error }
+  // 任务状态轮询: { status: running|done|error, progress: {done,total}, result, error }
   taskStatus(taskId) {
     return http.get(`/api/v2/works/comments/tasks/${taskId}`)
+  },
+  // 批次级一键评论（批次内全部成功明细逐个发评）: { content, pinned } → { task_id }
+  postBatch(batchId, content, pinned = false) {
+    return http.post(`/api/v2/history/${batchId}/comments`, { content, pinned })
+  },
+  // 批次级评论同步（批次内全部成功明细逐个抓取）→ { task_id }
+  syncBatch(batchId) {
+    return http.post(`/api/v2/history/${batchId}/comments/sync`)
   },
 }
 
