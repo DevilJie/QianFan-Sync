@@ -2146,7 +2146,8 @@ class DouyinPlatform(BasePlatform):
     #    页面自身的发布请求带 msToken+a_bogus 签名，但签名由页面内部网络层生成，
     #    无法外部复用（复制完整 URL 直 fetch 返回空响应体=风控拦截）→ 写操作走 DOM。
     # 4. DOM 发评实测会触发「接收短信验证码」人工风控（181*****07 手机号），
-    #    接口 200 但评论并不落地 → post/reply/delete 检测验证弹窗并诚实报错。
+    #    接口 200 但评论并不落地 → post/reply/delete 在有头浏览器中执行，
+    #    检测到验证弹窗后等待用户在窗口内接管完成（最长 5 分钟），超时才报错。
     # 5. 置顶能力：PC 前台/后台均未见置顶入口（创作者后台评论管理页不存在），
     #    且置顶仅限自己作品下自己的评论 → supports_pin_comment = False（诚实标注）。
     # ------------------------------------------------------------------
@@ -2158,14 +2159,15 @@ class DouyinPlatform(BasePlatform):
 
     _FRONT_HOME_URL = "https://www.douyin.com/"
 
-    async def _comment_page(self, cookie_file: str):
+    async def _comment_page(self, cookie_file: str, headless: bool = True):
         """打开前台登录态浏览器。返回 (browser, context, page)。
 
         cookie 全部 .douyin.com 域，后台 storage_state 前台通用；先 goto 首页
         让 ttwid/msToken 等运行时 cookie 刷新，再进详情页（否则可能被判游客）。
+        headless=False 时窗口可见，供用户接管风控验证（发评/回复/删除用）。
         """
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
-        browser = await self.create_browser(headless=True)
+        browser = await self.create_browser(headless=headless)
         context = await self.create_context(browser, storage_state=cookie_path)
         page = await context.new_page()
         await page.set_viewport_size({"width": 1920, "height": 1080})
@@ -2363,15 +2365,50 @@ class DouyinPlatform(BasePlatform):
         except Exception:
             return False
 
+    async def _wait_human_verify(self, page, timeout_s: int = 300) -> str:
+        """风控验证人工接管等待。
+
+        写操作在「有头浏览器」中执行：提交后若弹出短信验证码/滑块等
+        人工验证，保持窗口打开并轮询等待用户在窗口内完成验证。
+
+        返回：
+          "none"    — 等待窗口内未出现验证弹窗（可信环境直接通过）
+          "cleared" — 出现过验证弹窗，用户已完成验证（弹窗消失）
+          "timeout" — 弹窗持续存在超过 timeout_s，用户未完成
+        """
+        # 先给验证弹窗一个出现窗口（提交后可能延迟数秒才弹）
+        appeared = False
+        for _ in range(4):
+            if await self._detect_verify_dialog(page):
+                appeared = True
+                break
+            await asyncio.sleep(2)
+        if not appeared:
+            return "none"
+
+        logger.info(
+            "[抖音风控] 检测到人工验证弹窗，等待用户在浏览器窗口完成验证"
+            "（最长 %d 秒）…", timeout_s,
+        )
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(3)
+            if not await self._detect_verify_dialog(page):
+                logger.info("[抖音风控] 用户已完成验证，弹窗已消失")
+                await asyncio.sleep(2)
+                return "cleared"
+        logger.info("[抖音风控] 等待用户验证超时（%d 秒）", timeout_s)
+        return "timeout"
+
     async def post_comment(
         self, cookie_file: str, work_id: str, content: str, pinned: bool = False
     ) -> dict:
         """以前台登录态在作品详情页 DOM 发一条顶级评论。
 
-        踩点实证：自动化发评会触发「接收短信验证码」人工风控（接口 200 但
-        评论不落地）→ 检测到验证弹窗即返回失败并如实提示；未触发风控时
-        （可信环境）以评论区出现新评论为准。置顶不支持（见
-        supports_pin_comment 注释），pinned=True 仅忽略。
+        在「有头浏览器」中执行：触发短信验证码等人工风控时，等待用户在
+        弹出的浏览器窗口内完成验证（最长 5 分钟），验证通过后继续确认
+        评论落地。置顶不支持（见 supports_pin_comment 注释），pinned=True
+        仅忽略。
         """
         aweme_id = str(work_id or "").strip()
         text = (content or "").strip()
@@ -2380,7 +2417,7 @@ class DouyinPlatform(BasePlatform):
                     "message": "参数缺失（work_id / content）"}
         browser = None
         try:
-            browser, context, page = await self._comment_page(cookie_file)
+            browser, context, page = await self._comment_page(cookie_file, headless=False)
             await self._goto_work(page, aweme_id)
             focused = await page.evaluate(
                 """() => {
@@ -2423,10 +2460,12 @@ class DouyinPlatform(BasePlatform):
             await page.keyboard.press("Enter")
             await asyncio.sleep(5)
 
-            if await self._detect_verify_dialog(page):
-                msg = ("触发平台人工验证（短信验证码/安全验证），评论未发布；"
-                       "请在有头可信环境重试")
-                logger.info("[抖音发评] %s 触发人工风控", aweme_id)
+            # 风控验证人工接管：弹窗出现则等用户在可见窗口完成验证
+            vr = await self._wait_human_verify(page)
+            if vr == "timeout":
+                msg = ("触发平台人工验证（短信验证码/安全验证），等待用户验证超时，"
+                       "评论未发布；请重试并在弹出的浏览器窗口内完成验证")
+                logger.info("[抖音发评] %s 人工验证超时", aweme_id)
                 return {"ok": False, "comment_id": "", "pinned": False, "message": msg}
 
             # 轮询确认落地（接口 200 ≠ 展示；审核中会查不到 → 如实标注）
@@ -2486,7 +2525,7 @@ class DouyinPlatform(BasePlatform):
                     "message": "参数缺失（work_id / root_id / parent_id / content）"}
         browser = None
         try:
-            browser, context, page = await self._comment_page(cookie_file)
+            browser, context, page = await self._comment_page(cookie_file, headless=False)
             await self._goto_work(page, aweme_id)
 
             # 经 list 接口取目标评论文本作为 DOM 锚点
@@ -2531,9 +2570,12 @@ class DouyinPlatform(BasePlatform):
             await page.keyboard.press("Enter")
             await asyncio.sleep(5)
 
-            if await self._detect_verify_dialog(page):
-                msg = "触发平台人工验证（短信验证码/安全验证），回复未发布"
-                logger.info("[抖音回复] %s 触发人工风控", aweme_id)
+            # 风控验证人工接管
+            vr = await self._wait_human_verify(page)
+            if vr == "timeout":
+                msg = ("触发平台人工验证（短信验证码/安全验证），等待用户验证超时，"
+                       "回复未发布；请重试并在弹出的浏览器窗口内完成验证")
+                logger.info("[抖音回复] %s 人工验证超时", aweme_id)
                 return {"ok": False, "comment_id": "", "message": msg}
 
             # 确认：楼中楼列表出现新文本
@@ -2585,7 +2627,7 @@ class DouyinPlatform(BasePlatform):
             return {"ok": False, "message": "参数缺失（work_id / comment_id）"}
         browser = None
         try:
-            browser, context, page = await self._comment_page(cookie_file)
+            browser, context, page = await self._comment_page(cookie_file, headless=False)
             await self._goto_work(page, aweme_id)
 
             tree = await self._fetch_comment_tree(page, aweme_id, 100)
@@ -2637,10 +2679,44 @@ class DouyinPlatform(BasePlatform):
                 return {"ok": False, "message": msg}
             await asyncio.sleep(3)
 
-            if await self._detect_verify_dialog(page):
-                msg = "触发平台人工验证（短信验证码/安全验证），删除未执行"
-                logger.info("[抖音删评] %s 触发人工风控", aweme_id)
+            # 风控验证人工接管；验证通过后如评论仍在，自动重试一次删除
+            vr = await self._wait_human_verify(page)
+            if vr == "timeout":
+                msg = ("触发平台人工验证（短信验证码/安全验证），等待用户验证超时，"
+                       "删除未执行；请重试并在弹出的浏览器窗口内完成验证")
+                logger.info("[抖音删评] %s 人工验证超时", aweme_id)
                 return {"ok": False, "message": msg}
+            if vr == "cleared":
+                retry = await page.evaluate(
+                    """async (anchor) => {
+                        const items = [...document.querySelectorAll(
+                            '[data-e2e="comment-item"]')];
+                        const target = items.find(it =>
+                            (it.textContent || '').includes(anchor));
+                        if (!target) return 'gone';
+                        const more = target.querySelector(
+                            '[data-e2e="video-comment-more"]');
+                        if (!more) return 'no-more-btn';
+                        more.dispatchEvent(new MouseEvent('mouseover',
+                            {bubbles: true}));
+                        more.click();
+                        await new Promise(r => setTimeout(r, 1200));
+                        const del = [...document.querySelectorAll('span,div,li')]
+                            .find(e => (e.textContent || '').trim() === '删除'
+                                && e.offsetParent !== null && e.children.length === 0);
+                        if (!del) return 'menu-no-delete';
+                        del.click();
+                        await new Promise(r => setTimeout(r, 1200));
+                        const confirm = [...document.querySelectorAll('button')]
+                            .find(b => ['确定', '删除', '确认'].some(x =>
+                                (b.textContent || '').trim() === x));
+                        if (confirm) { confirm.click(); return 'confirmed'; }
+                        return 'clicked-no-dialog';
+                    }""",
+                    anchor_text[:30],
+                )
+                logger.info("[抖音删评] %s 验证通过后重试删除: %s", aweme_id, retry)
+                await asyncio.sleep(3)
 
             gone = await page.evaluate(
                 """async ([aid, cid]) => {

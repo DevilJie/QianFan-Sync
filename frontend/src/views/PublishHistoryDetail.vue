@@ -540,11 +540,12 @@ watch(() => selectedItem.value?.id, (id) => {
   if (id) fetchComments()
 })
 
-// 轮询批量评论任务（每明细开浏览器 30~90s，N 个账号串行可能数分钟）：
-// 每 3s 一次，上限按明细数放大（每明细最多 20 次轮询）
+// 轮询批量评论任务（每明细开浏览器 30~90s，N 个账号串行可能数分钟；
+// 抖音写操作可能等待人工验证最长 5 分钟）：
+// 每 3s 一次，上限按明细数放大（每明细最多 150 次轮询）
 function pollCommentTask(taskId, total, onDone) {
   let polls = 0
-  const maxPolls = Math.max(60, total * 20)
+  const maxPolls = Math.max(60, total * 150)
   clearInterval(commentsTimer)
   commentsTimer = setInterval(async () => {
     polls += 1
