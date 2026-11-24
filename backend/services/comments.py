@@ -317,7 +317,7 @@ _BATCH_SELECT = """
 """
 
 
-def _load_batch_details(batch_id: str) -> list[dict]:
+def _load_batch_details_raw(batch_id: str) -> list[dict]:
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
     try:
@@ -364,13 +364,51 @@ def start_sync_comments_batch(batch_id: str) -> str:
     return task_id
 
 
+def _load_batch_details(batch_id: str):
+    """批次内 success 明细筛选：可评论的返回执行列表，其余归入跳过清单。
+
+    跳过规则（用户预期：不可评论的直接跳过，不算失败）：
+      - 未发布成功 → 不参与（调用方已按 status='success' 过滤）
+      - 平台未注册 / 未实现评论体系 → 跳过「平台暂未支持评论功能，敬请期待」
+      - 未关联作品链接(work_id/publish_url 均无) → 跳过「未关联作品」
+    """
+    keep, skipped = [], []
+    for d in _load_batch_details_raw(batch_id):
+        platform_id = d.get("platform_id")
+        supported = False
+        if platform_id:
+            from impl.registry import get_platform
+            p = get_platform(platform_id)
+            supported = bool(p and getattr(p, "supports_comment", False))
+        if not supported:
+            skipped.append({
+                "account_name": d.get("account_name") or "",
+                "reason": "平台暂未支持评论功能，敬请期待",
+            })
+        elif not _resolve_work_id(d):
+            skipped.append({
+                "account_name": d.get("account_name") or "",
+                "reason": "未关联作品链接",
+            })
+        else:
+            keep.append(d)
+    return keep, skipped
+
+
 def _run_batch(task_id: str, batch_id: str, kind: str,
                content: str | None, pinned: bool) -> None:
-    details = _load_batch_details(batch_id)
+    details, skipped = _load_batch_details(batch_id)
     if not details:
-        _finish_error(task_id, "该批次没有发布成功的明细")
+        _finish_error(
+            task_id,
+            "该批次没有可评论的明细"
+            + (f"（跳过 {len(skipped)} 个：未发布成功/未关联作品/平台暂未支持）"
+               if skipped else ""),
+        )
         return
     total = len(details)
+    with _tasks_lock:
+        _tasks[task_id]["skipped"] = skipped
     results: list[dict] = []
     for i, detail in enumerate(details):
         with _tasks_lock:
@@ -401,11 +439,12 @@ def _run_batch(task_id: str, batch_id: str, kind: str,
             status="done",
             progress={"done": total, "total": total},
             result={"ok": True, "results": results,
-                    "succeed": succeed, "total": total},
+                    "succeed": succeed, "total": total,
+                    "skipped": skipped},
         )
     logger.info(
-        "[Comments] 批量%s完成 batch=%s 成功 %d/%d",
-        "发评" if kind == "post" else "同步", batch_id, succeed, total,
+        "[Comments] 批量%s完成 batch=%s 成功 %d/%d 跳过 %d",
+        "发评" if kind == "post" else "同步", batch_id, succeed, total, len(skipped),
     )
 
 

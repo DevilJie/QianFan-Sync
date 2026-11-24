@@ -171,11 +171,17 @@
                 </div>
               </header>
 
+              <!-- 平台不支持评论时显示敬请期待提示 -->
+              <div v-if="!commentsCaps.supports_comment && !commentsLoading" class="comments-expect">
+                「{{ selectedAccount?.platform || '该平台' }}」的评论功能正在建设中，敬请期待～
+                <span class="expect-sub">支持平台：B站、头条、百家号（抖音仅支持同步与删除）</span>
+              </div>
+
               <div v-if="commentsLoading" class="comments-empty">评论加载中…</div>
-              <div v-else-if="!displayComments.length" class="comments-empty">
+              <div v-else-if="!displayComments.length && commentsCaps.supports_comment" class="comments-empty">
                 暂无评论数据，点击右上角「同步评论」从平台拉取
               </div>
-              <div v-else class="comment-list">
+              <div v-else-if="displayComments.length" class="comment-list">
                 <div v-for="(c, i) in displayComments" :key="c.id" class="comment-item">
                   <div class="comment-avatar" :style="{ background: avatarColor(i) }">{{ c.author.charAt(0) }}</div>
                   <div class="comment-main">
@@ -581,6 +587,13 @@ function summarizeFailures(results) {
   return fails.map(r => `${r.account_name || r.detail_id}（${r.message}）`).join('；')
 }
 
+// 跳过明细汇总（未发布成功/未关联作品/平台暂未支持 → 不算失败，仅提示）
+function summarizeSkipped(skipped) {
+  const list = skipped || []
+  if (!list.length) return ''
+  return `已跳过 ${list.length} 个账号（${[...new Set(list.map(s => s.reason))].join('、')}）`
+}
+
 // ===== 同步评论：批次内全部成功明细逐个抓取评论区 → 落库 → 重新渲染 =====
 async function syncComments() {
   const batchId = batch.value?.id
@@ -600,7 +613,9 @@ async function syncComments() {
         return
       }
       const failMsg = summarizeFailures(result?.results)
-      if (failMsg) ElMessage.warning(`同步完成 ${result.succeed}/${result.total}，失败：${failMsg}`)
+      const skipMsg = summarizeSkipped(result?.skipped)
+      if (failMsg) ElMessage.warning(`同步完成 ${result.succeed}/${result.total}，失败：${failMsg}${skipMsg ? '；' + skipMsg : ''}`)
+      else if (skipMsg) ElMessage.success(`评论同步完成（共 ${result.total} 个账号）；${skipMsg}`)
       else ElMessage.success(`评论同步完成（共 ${result.total} 个账号）`)
     })
   } catch (e) {
@@ -696,7 +711,9 @@ async function submitComment() {
       }
       commentDialogVisible.value = false
       const failMsg = summarizeFailures(result?.results)
-      if (failMsg) ElMessage.warning(`发布完成 ${result.succeed}/${result.total}，失败：${failMsg}`)
+      const skipMsg = summarizeSkipped(result?.skipped)
+      if (failMsg) ElMessage.warning(`发布完成 ${result.succeed}/${result.total}，失败：${failMsg}${skipMsg ? '；' + skipMsg : ''}`)
+      else if (skipMsg) ElMessage.success(`评论已发布（共 ${result.total} 个账号）；${skipMsg}`)
       else ElMessage.success(`评论已发布（共 ${result.total} 个账号${commentPinned.value ? '，已尝试置顶' : ''}）`)
     })
   } catch (e) {
@@ -1300,6 +1317,25 @@ onMounted(async () => {
   text-align: center;
   font-size: 13px;
   color: $text-muted;
+}
+
+// 平台不支持评论：敬请期待提示
+.comments-expect {
+  margin: 8px 0 4px;
+  padding: 14px 16px;
+  border: 1px dashed $border;
+  border-radius: 10px;
+  font-size: 13px;
+  color: $text-muted;
+  background: rgba(139, 92, 246, 0.04);
+
+  .expect-sub {
+    display: block;
+    margin-top: 4px;
+    font-size: 12px;
+    color: $text-muted;
+    opacity: 0.8;
+  }
 }
 
 .comments-toolbar {
