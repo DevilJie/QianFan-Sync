@@ -8,6 +8,7 @@ Chromium) with automatic Playwright fallback.
 
 import asyncio
 import os
+import re
 import time
 from datetime import datetime
 
@@ -3520,6 +3521,64 @@ class BaijiahaoPlatform(BasePlatform):
                                 .match(/"tid"\\s*:\\s*"(\\d+)"/);
                             return m ? m[1] : '';
                         }""")
+
+                # 视频作品兜底：s?id 会 302 到 haokan.baidu.com(好看视频)，
+                # 该页评论为服务端渲染、无 ext 接口。真实可交互的评论组件在
+                # mbd 落地页(nid=sv_{vid})上，thread_id 从组件发出的
+                # ext.baidu.com comment/list 请求 URL 中捕获（实机验证）。
+                if not tid and re.search(
+                    r"haokan\.baidu\.com|mbd\.baidu\.com|vid=\d+|nid=sv_",
+                    current_url,
+                ):
+                    m = (re.search(r"nid=sv_(\d+)", current_url)
+                         or re.search(r"[?&]vid=(\d+)", current_url))
+                    if m:
+                        landing = (
+                            "https://mbd.baidu.com/newspage/data/videolanding"
+                            f"?nid=sv_{m.group(1)}"
+                        )
+                        logger.info(
+                            "[百家号评论] 视频作品，改走 mbd 落地页: %s", landing,
+                        )
+                        page2 = await context.new_page()
+                        tid_holder: list[str] = []
+
+                        def _on_request(req):
+                            mm = re.search(
+                                r"ext\.baidu\.com/api/comment/v2/comment/list"
+                                r"\?[^&]*&*.*?thread_id=(\d+)", req.url,
+                            )
+                            if mm:
+                                tid_holder.append(mm.group(1))
+
+                        page2.on("request", _on_request)
+                        try:
+                            await page2.goto(
+                                landing, wait_until="domcontentloaded",
+                                timeout=30000,
+                            )
+                        except Exception:
+                            pass
+                        # 滚动触发评论组件懒加载，等组件发出列表请求
+                        for _ in range(6):
+                            if tid_holder:
+                                break
+                            await page2.evaluate("window.scrollBy(0, 700)")
+                            await asyncio.sleep(2)
+                        tid = tid_holder[0] if tid_holder else ""
+                        if tid:
+                            # 换到加载了评论组件的页签继续后续操作
+                            try:
+                                await page.close()
+                            except Exception:
+                                pass
+                            page = page2
+                        else:
+                            try:
+                                await page2.close()
+                            except Exception:
+                                pass
+
                 if not tid:
                     raise RuntimeError(
                         f"未能从作品页解析评论 thread_id(页面: {current_url[:120]})")
