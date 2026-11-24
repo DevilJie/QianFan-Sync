@@ -89,6 +89,10 @@ export const commentsApi = {
   syncBatch(batchId) {
     return http.post(`/api/v2/history/${batchId}/comments/sync`)
   },
+  // 删除一条评论（浏览器自动化，异步）→ { task_id }
+  remove(detailId, commentId) {
+    return http.delete(`/api/v2/works/${detailId}/comments/${commentId}`)
+  },
 }
 
 // 统计数据

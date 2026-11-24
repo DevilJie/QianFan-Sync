@@ -436,6 +436,8 @@ class BasePlatform(ABC):
     # 平台是否支持「作者发评 + 置顶」：前端据此显示/隐藏置顶选项
     supports_comment = False
     supports_pin_comment = False
+    # 平台是否支持「UP主删除评论区评论」：前端据此显示/隐藏删除按钮
+    supports_delete_comment = False
 
     async def list_comments(
         self, cookie_file: str, work_id: str, limit: int = 100
@@ -471,4 +473,16 @@ class BasePlatform(ABC):
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support posting comments"
+        )
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """以 UP 主身份删除自己评论区下的一条评论。
+
+        返回 {"ok": bool, "message": str}。
+        失败 → {"ok": False, "message": 原因}（不抛异常）。
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support deleting comments"
         )

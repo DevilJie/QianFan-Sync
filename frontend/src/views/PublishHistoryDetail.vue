@@ -189,6 +189,12 @@
                     <div class="comment-ops">
                       <span class="op"><el-icon><CaretTop /></el-icon>{{ c.like_count }}</span>
                       <span class="op"><el-icon><ChatDotRound /></el-icon>回复</span>
+                      <span
+                        v-if="commentCaps.supports_delete_comment"
+                        class="op op-delete"
+                        title="删除这条评论"
+                        @click="removeComment(c)"
+                      >删除</span>
                     </div>
                     <!-- 楼中楼回复 -->
                     <div v-if="visibleReplies(c).length" class="comment-replies">
@@ -478,7 +484,11 @@ const commentSort = ref('hot')          // 'hot' 最热（按点赞）| 'new' �
 const expandedReplies = reactive(new Set())  // 已展开楼中楼的评论 id
 
 const comments = ref([])                // 后端 work_comments 的前端投影
-const commentsCaps = ref({ supports_comment: false, supports_pin_comment: false })
+const commentsCaps = ref({
+  supports_comment: false,
+  supports_pin_comment: false,
+  supports_delete_comment: false,
+})
 const commentsLoading = ref(false)
 const commentsSyncing = ref(false)
 let commentsTimer = null
@@ -500,6 +510,7 @@ async function fetchComments() {
     commentsCaps.value = {
       supports_comment: !!res?.data?.supports_comment,
       supports_pin_comment: !!res?.data?.supports_pin_comment,
+      supports_delete_comment: !!res?.data?.supports_delete_comment,
     }
     comments.value = res?.data?.items || []
   } catch (e) {
@@ -630,6 +641,35 @@ async function submitComment() {
     commentPosting.value = false
     commentProgressText.value = ''
     ElMessage.error('触发发布失败: ' + (e?.message || e))
+  }
+}
+
+// ===== 删除评论：确认 → 浏览器自动化删评 → 刷新列表 =====
+const commentDeleting = ref(false)
+
+async function removeComment(c) {
+  const detailId = selectedItem.value?.id
+  if (!detailId || commentDeleting.value) return
+  try {
+    await ElMessageBox.confirm(
+      `确定删除${c.isAuthor ? '自己发布的' : '「' + c.author + '」的'}评论「${c.content.slice(0, 30)}${c.content.length > 30 ? '…' : ''}」？`,
+      '删除评论',
+      { confirmButtonText: '删除', cancelButtonText: '取消', type: 'warning' },
+    )
+  } catch { return }
+  commentDeleting.value = true
+  try {
+    const res = await commentsApi.remove(detailId, c.id)
+    const taskId = res?.data?.task_id
+    if (!taskId) throw new Error('未返回任务 ID')
+    pollCommentTask(taskId, 1, (err) => {
+      commentDeleting.value = false
+      if (err) ElMessage.error('删除失败: ' + err)
+      else ElMessage.success('评论已删除')
+    })
+  } catch (e) {
+    commentDeleting.value = false
+    ElMessage.error('触发删除失败: ' + (e?.message || e))
   }
 }
 
@@ -1332,6 +1372,9 @@ onMounted(async () => {
 
     .el-icon { font-size: 14px; }
     &:hover { color: $brand-start; }
+
+    // 删除操作：hover 变红警示
+    &.op-delete:hover { color: #f43f5e; }
   }
 }
 

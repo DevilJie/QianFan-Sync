@@ -2225,6 +2225,7 @@ class BilibiliPlatform(BasePlatform):
 
     supports_comment = True
     supports_pin_comment = True
+    supports_delete_comment = True
 
     async def _comment_page(self, cookie_file: str):
         """打开已登录的创作中心页（与 api.bilibili.com 共享 SSO cookie），
@@ -2516,6 +2517,64 @@ class BilibiliPlatform(BasePlatform):
             }
         except Exception as e:
             logger.info(f"[bilibili post_comment] 发布失败: {e}")
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """页内 fetch 删除评论（/x/v2/reply/del，type=1，csrf 取 bili_jct）。
+
+        UP 主可删除自己评论区下任意评论（含楼中楼，传对应 rpid）。
+        """
+        bvid = (work_id or "").strip()
+        rpid = str(comment_id or "").strip()
+        if not bvid or not rpid:
+            return {"ok": False, "message": "参数缺失（work_id / comment_id）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            result = await page.evaluate(
+                """
+                async ([bvid, rpid]) => {
+                    const viewResp = await fetch(
+                        'https://api.bilibili.com/x/web-interface/view?bvid=' + bvid,
+                        { credentials: 'include' });
+                    const view = await viewResp.json();
+                    if (view.code !== 0) return { ok: false, message: '取稿件信息失败: ' + view.message };
+                    const aid = view.data.aid;
+                    const csrf = (document.cookie.match(/bili_jct=([^;]+)/) || [])[1] || '';
+                    if (!csrf) return { ok: false, message: 'cookie 中无 bili_jct（csrf）' };
+
+                    const body = new URLSearchParams({
+                        oid: String(aid), type: '1', rpid: rpid,
+                        csrf: csrf, csrf_token: csrf,
+                    });
+                    const delResp = await fetch('https://api.bilibili.com/x/v2/reply/del', {
+                        method: 'POST', credentials: 'include',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString(),
+                    });
+                    const del = await delResp.json();
+                    if (del.code !== 0) return { ok: false, message: '删除失败: ' + (del.message || del.code) };
+                    return { ok: true, message: '' };
+                }
+                """,
+                [bvid, rpid],
+            )
+            if not isinstance(result, dict) or not result.get("ok"):
+                msg = (result or {}).get("message", "未知错误") if isinstance(result, dict) else str(result)
+                logger.info(f"[bilibili delete_comment] {bvid} rpid={rpid} 失败: {msg}")
+                return {"ok": False, "message": msg}
+            logger.info(f"[bilibili delete_comment] {bvid} rpid={rpid} 删除成功")
+            return {"ok": True, "message": ""}
+        except Exception as e:
+            logger.info(f"[bilibili delete_comment] 删除失败: {e}")
             return {"ok": False, "message": str(e)}
         finally:
             if browser is not None:

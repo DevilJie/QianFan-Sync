@@ -835,6 +835,16 @@ def sync_batch_comments(batch_id):
     return jsonify({"code": 200, "data": {"task_id": start_sync_comments_batch(batch_id)}})
 
 
+@ext_api.route('/works/<detail_id>/comments/<comment_id>', methods=['DELETE'])
+def delete_work_comment(detail_id, comment_id):
+    """删除一条评论（浏览器自动化，异步执行；UP主删自己评论区评论）。
+
+    Response 200: {"code": 200, "data": {"task_id": str}}
+    """
+    from services.comments import start_delete_comment
+    return jsonify({"code": 200, "data": {"task_id": start_delete_comment(detail_id, comment_id)}})
+
+
 @ext_api.route('/works/comments/tasks/<task_id>', methods=['GET'])
 def get_comment_task(task_id):
     """评论任务状态轮询：{status: running|done|error, result, error}。"""

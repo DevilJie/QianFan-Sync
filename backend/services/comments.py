@@ -410,6 +410,72 @@ def _run_batch(task_id: str, batch_id: str, kind: str,
 
 
 # ---------------------------------------------------------------------------
+# 删除评论（单条）
+# ---------------------------------------------------------------------------
+
+def start_delete_comment(detail_id: str, comment_id: str) -> str:
+    """启动后台删评任务（浏览器自动化），返回 task_id。"""
+    task_id = str(uuid.uuid4())
+    with _tasks_lock:
+        _tasks[task_id] = {
+            "status": "running", "kind": "delete", "detail_id": detail_id,
+            "comment_id": comment_id,
+            "result": None, "error": "", "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    threading.Thread(
+        target=_run_delete, args=(task_id, detail_id, comment_id),
+        daemon=True, name=f"comment-del-{task_id[:8]}",
+    ).start()
+    return task_id
+
+
+def _run_delete(task_id: str, detail_id: str, comment_id: str) -> None:
+    detail = _load_detail(detail_id)
+    if not detail:
+        _finish_error(task_id, "发布明细不存在")
+        return
+    platform_id = detail.get("platform_id")
+    cookie_file = (detail.get("cookie_file") or "").strip()
+    if not platform_id or not cookie_file:
+        _finish_error(task_id, "账号不存在或 cookie 配置缺失")
+        return
+    work_id = _resolve_work_id(detail)
+    if not work_id:
+        _finish_error(task_id, "未找到作品 ID（请先执行「重新关联」回填作品链接）")
+        return
+
+    ok, result = _call_platform(
+        platform_id, cookie_file, "delete_comment",
+        work_id=work_id, comment_id=comment_id,
+    )
+    if not ok:
+        _finish_error(task_id, result.get("message") or "该平台暂未支持删除评论")
+        return
+    if not result.get("ok"):
+        with _tasks_lock:
+            _tasks[task_id].update(status="error", error=result.get("message") or "删除失败")
+        return
+
+    # 平台删除成功 → 同步删本地行；删顶级评论时其楼中楼一并删除
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        try:
+            conn.execute(
+                "DELETE FROM work_comments WHERE detail_id = ? AND (comment_id = ? OR parent_id = ?)",
+                (detail_id, comment_id, comment_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.warning("[Comments] 本地评论行删除失败(不影响平台结果): %s", exc)
+
+    with _tasks_lock:
+        _tasks[task_id].update(status="done", result={"ok": True, "message": "评论已删除"})
+    logger.info("[Comments] 删评完成 detail=%s comment=%s", detail_id, comment_id)
+
+
+# ---------------------------------------------------------------------------
 # 查询
 # ---------------------------------------------------------------------------
 
@@ -424,7 +490,11 @@ def get_task(task_id: str) -> dict:
 def list_comments(detail_id: str) -> dict:
     """读库返回已同步的评论（前端渲染结构）+ 平台能力标记。"""
     detail = _load_detail(detail_id)
-    caps = {"supports_comment": False, "supports_pin_comment": False}
+    caps = {
+        "supports_comment": False,
+        "supports_pin_comment": False,
+        "supports_delete_comment": False,
+    }
     if detail and detail.get("platform_id"):
         from impl.registry import get_platform
         p = get_platform(detail["platform_id"])
@@ -432,6 +502,7 @@ def list_comments(detail_id: str) -> dict:
             caps = {
                 "supports_comment": bool(getattr(p, "supports_comment", False)),
                 "supports_pin_comment": bool(getattr(p, "supports_pin_comment", False)),
+                "supports_delete_comment": bool(getattr(p, "supports_delete_comment", False)),
             }
 
     conn = sqlite3.connect(str(DB_PATH))
