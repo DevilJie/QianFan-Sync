@@ -1,4 +1,4 @@
-"""淘宝光合平台实现 — 100% CloakBrowser。
+﻿"""淘宝光合平台实现 — 100% CloakBrowser。
 
 所有浏览器操作通过 ``BasePlatform.create_browser()`` /
 ``BasePlatform.create_context()`` 委托给 CloakBrowser（隐身 Chromium）。
@@ -62,6 +62,20 @@ _GUANGHE_WORKSPACE_URL = "https://creator.guanghe.taobao.com/page/workspace/tb"
 # mtop h5 网关列表接口（工作台页面自己请求的同一接口，2026-11 踩点实证）
 _GUANGHE_MTOP_LIST_API = "mtop.taobao.gcm.content.admin.list"
 _GUANGHE_MTOP_APP_KEY = "12574478"
+
+# 评论接口（2026-11-25 实机踩点实证：创作中心内容详情评论管理页
+# creator.guanghe.taobao.com/page/unify/contentDetail?contentId=<id>&tab=1
+# 自身请求的同一组 mtop h5 接口，GET + md5(token&t&appKey&data) 签名，无 csrf）
+_GUANGHE_COMMENT_LIST_API = "mtop.taobao.gcm.comment.collapse.list"
+_GUANGHE_COMMENT_PUBLISH_API = "mtop.taobao.gcm.comment.publishAndGet"
+_GUANGHE_COMMENT_TOP_API = "mtop.taobao.gcm.comment.top"
+_GUANGHE_COMMENT_DELETE_API = "mtop.taobao.gcm.comment.delete"
+
+# 内容详情页（评论管理 tab=1）URL 模板
+_GUANGHE_DETAIL_URL = (
+    "https://creator.guanghe.taobao.com/page/unify/contentDetail"
+    "?contentId={cid}&tab=1&mode=0&contentType=video&source=guanghe"
+)
 
 # 视频发布限制（详见 zfb.md）
 _GUANGHE_MAX_TITLE_LEN = 30       # 标题 ≤30 字
@@ -1955,6 +1969,347 @@ class TaobaoGuanghePlatform(BasePlatform):
                 await browser.close()
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # 作品评论（一键评论 / 评论同步）
+    # 2026-11-25 实机踩点实证（账号 52 程序员老蔡，测试评论已全部清理）：
+    #   列表  mtop.taobao.gcm.comment.collapse.list（cursor 翻页）
+    #   发评  mtop.taobao.gcm.comment.publishAndGet（返回 commentId）
+    #   置顶  mtop.taobao.gcm.comment.top（top: true/false）
+    #   删除  mtop.taobao.gcm.comment.delete（传 commentId）
+    # 全部为 GET + md5(token&t&appKey&data) 签名，页内 fetch 直调，无 csrf。
+    # 注：publishAndGet 带 parentCommentId/rootCommentId 可回复成功，但踩点
+    # 实测光河创作者端评论为扁平展示（回复以独立评论出现），楼中楼结构由平台
+    # 前端自行处理。
+    # ------------------------------------------------------------------
+
+    supports_comment = True
+    supports_pin_comment = True
+    supports_delete_comment = True
+
+    async def _comment_page(self, cookie_file: str, work_id: str):
+        """打开已登录的内容详情评论管理页，返回 (browser, context, page)。
+
+        调用方负责三层关闭。cookie 失效（跳登录页）抛 RuntimeError。
+        """
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        context = await self.create_context(browser, storage_state=cookie_path)
+        page = await context.new_page()
+        await page.goto(
+            _GUANGHE_DETAIL_URL.format(cid=work_id),
+            wait_until="domcontentloaded", timeout=30000,
+        )
+        await asyncio.sleep(3)
+        if "login.taobao.com" in (page.url or ""):
+            raise RuntimeError("cookie 失效（跳转到登录页）")
+        return browser, context, page
+
+    async def _mtop_call(self, page, api: str, data: dict):
+        """页内 fetch 直调 mtop h5 网关（与页面自身请求同一通道）。
+
+        sign 按 mtop 公开算法 md5(token & t & appKey & data)，token 现场读
+        页内 _m_h5_tk cookie；过期时 mtop 会在响应头 Set-Cookie 下发新
+        token，重读后重试（最多 3 次）。异常/失败返回原响应 dict。
+        """
+        data_str = json.dumps(data, separators=(",", ":"))
+        last: dict = {}
+        for _ in range(3):
+            token = await page.evaluate(
+                "() => { const m = document.cookie"
+                ".match(/(?:^|;\\s*)_m_h5_tk=([^;_]+)/);"
+                " return m ? m[1] : ''; }"
+            )
+            t = str(int(time.time() * 1000))
+            sign = hashlib.md5(
+                f"{token}&{t}&{_GUANGHE_MTOP_APP_KEY}&{data_str}".encode()
+            ).hexdigest()
+            last = await page.evaluate(
+                """async ([api, t, sign, dataStr]) => {
+                    try {
+                        const resp = await fetch(
+                            'https://h5api.m.taobao.com/h5/' + api + '/1.0/'
+                            + '?jsv=2.6.1&appKey=12574478&t=' + t + '&sign=' + sign
+                            + '&api=' + api + '&v=1.0'
+                            + '&dataType=json&valueType=original&type=originaljson'
+                            + '&data=' + encodeURIComponent(dataStr),
+                            {credentials: 'include'});
+                        return await resp.json();
+                    } catch (e) {
+                        return {ret: ['FETCH_FAIL::' + e.message]};
+                    }
+                }""",
+                [api, t, sign, data_str],
+            )
+            ret_text = ";".join(str(r) for r in (last or {}).get("ret") or [])
+            if "TOKEN_EXOIRED" in ret_text or "TOKEN_EMPTY" in ret_text:
+                await asyncio.sleep(1.5)
+                continue
+            break
+        return last
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """抓取作品评论区（collapse.list，cursor 翻页，含楼中楼 replyList）。
+
+        work_id 为光合作品数字 ID（list_works 返回的 work_id）。
+        cookie 失效 / 抓取失败 → 返回 []（不抛异常）。
+        """
+        work_id = str(work_id or "").strip()
+        if not work_id:
+            return []
+        browser = None
+        page = None
+        context = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file, work_id)
+
+            def _fmt(c: dict, parent_id: str, pinned: bool) -> dict:
+                nick = str(c.get("commenterNick") or "")
+                is_author = str((c.get("features") or {}).get("isAuthor") or "") == "作者"
+                return {
+                    "comment_id": str(c.get("commentId") or ""),
+                    "parent_id": parent_id,
+                    "author": nick,
+                    "avatar": str(c.get("commenterLogo") or ""),
+                    "content": str(c.get("content") or ""),
+                    "like_count": int(((c.get("interactDatas") or {}).get("likeCount")) or 0),
+                    "reply_count": len(c.get("replyList") or []),
+                    "publish_time": str(c.get("publishTimeStr") or ""),
+                    "location": "",
+                    "is_author": is_author,
+                    "pinned": pinned,
+                }
+
+            comments: list[dict] = []
+            cursor = ""
+            for _ in range(10):  # 翻页上限防卡死
+                resp = await self._mtop_call(page, _GUANGHE_COMMENT_LIST_API, {
+                    "namespace": "guangguang", "targetId": work_id,
+                    "source": "guanghe", "mode": 0, "agentType": "", "cursor": cursor,
+                })
+                if not isinstance(resp, dict):
+                    logger.info(
+                        "[taobao_guanghe list_comments] 接口响应异常: %s", str(resp)[:200]
+                    )
+                    break
+                ret_text = ";".join(str(r) for r in (resp.get("ret") or []))
+                if "SUCCESS" not in ret_text:
+                    logger.info(
+                        "[taobao_guanghe list_comments] %s 拉取失败: %s",
+                        work_id, ret_text[:120],
+                    )
+                    break
+                model = (resp.get("data") or {}).get("model") or {}
+                rows = model.get("data") or []
+                for row in rows:
+                    comments.append(_fmt(row, "", bool(row.get("top"))))
+                    for rp in row.get("replyList") or []:
+                        comments.append(
+                            _fmt(rp, str(row.get("commentId") or ""), False)
+                        )
+                if len(comments) >= int(limit or 100) or not model.get("hasNext"):
+                    break
+                next_cursor = str(model.get("pageIndex") or "")
+                if not next_cursor or next_cursor == cursor:
+                    break
+                cursor = next_cursor
+
+            logger.info(
+                "[taobao_guanghe list_comments] %s 抓到 %d 条评论",
+                work_id, len(comments),
+            )
+            return comments[: int(limit or 100)]
+        except Exception as e:
+            logger.info(f"[taobao_guanghe list_comments] 抓取失败: {e}")
+            return []
+        finally:
+            if browser is not None:
+                if page is not None:
+                    try:
+                        await page.close()
+                        await context.close()
+                    except Exception:
+                        pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """以作者身份在作品下发布一条评论（publishAndGet），按需置顶（top）。
+
+        置顶接口对刚发布的评论可能索引未生效，间隔重试（最多 6 次 × 2s）。
+        失败 → {"ok": False, "message": 原因}（不抛异常）。
+        """
+        work_id = str(work_id or "").strip()
+        content = (content or "").strip()[:200]  # 平台上限 200 字
+        if not work_id or not content:
+            return {"ok": False, "message": "参数缺失（work_id / content）"}
+        browser = None
+        page = None
+        context = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file, work_id)
+            resp = await self._mtop_call(page, _GUANGHE_COMMENT_PUBLISH_API, {
+                "source": "guanghe", "mode": "0", "agentType": "",
+                "targetId": work_id, "content": content,
+            })
+            ret_text = ";".join(str(r) for r in (resp or {}).get("ret") or [])
+            comment_id = str(((resp or {}).get("data") or {}).get("model", {}).get("commentId") or "")
+            if "SUCCESS" not in ret_text or not comment_id:
+                msg = ret_text or str(resp)[:150]
+                logger.info(f"[taobao_guanghe post_comment] {work_id} 发评失败: {msg}")
+                return {"ok": False, "message": f"发评失败: {msg}"}
+
+            pinned_ok = False
+            pinned_err = ""
+            if pinned:
+                for i in range(6):
+                    await asyncio.sleep(0.5 if i == 0 else 2)
+                    top = await self._mtop_call(page, _GUANGHE_COMMENT_TOP_API, {
+                        "source": "guanghe", "mode": "0", "agentType": "",
+                        "targetId": work_id, "commentId": int(comment_id), "top": True,
+                    })
+                    top_ret = ";".join(str(r) for r in (top or {}).get("ret") or [])
+                    model = ((top or {}).get("data") or {}).get("model")
+                    if "SUCCESS" in top_ret and model is True:
+                        pinned_ok = True
+                        break
+                    pinned_err = top_ret or str(top)[:120]
+                if not pinned_ok:
+                    logger.info(
+                        f"[taobao_guanghe post_comment] {work_id} 置顶失败: {pinned_err}"
+                    )
+                    return {
+                        "ok": True, "comment_id": comment_id, "pinned": False,
+                        "message": f"评论已发布，但置顶失败: {pinned_err}",
+                    }
+            logger.info(
+                f"[taobao_guanghe post_comment] {work_id} 发布成功 "
+                f"comment_id={comment_id} pinned={pinned_ok}"
+            )
+            return {
+                "ok": True, "comment_id": comment_id,
+                "pinned": pinned_ok, "message": "",
+            }
+        except Exception as e:
+            logger.info(f"[taobao_guanghe post_comment] 发布失败: {e}")
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                if page is not None:
+                    try:
+                        await page.close()
+                        await context.close()
+                    except Exception:
+                        pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """回复一条评论（publishAndGet + parentCommentId/rootCommentId）。
+
+        踩点实测：光河创作者端回复接口调用成功，但评论为扁平展示（回复以
+        独立评论出现），楼中楼结构由平台前端处理。root_id 与 parent_id 必填
+        以对齐契约。
+        """
+        work_id = str(work_id or "").strip()
+        root_id = str(root_id or "").strip()
+        parent_id = str(parent_id or "").strip()
+        content = (content or "").strip()[:200]
+        if not work_id or not root_id or not parent_id or not content:
+            return {"ok": False, "message": "参数缺失（work_id / root_id / parent_id / content）"}
+        browser = None
+        page = None
+        context = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file, work_id)
+            resp = await self._mtop_call(page, _GUANGHE_COMMENT_PUBLISH_API, {
+                "source": "guanghe", "mode": "0", "agentType": "",
+                "targetId": work_id, "content": content,
+                "parentCommentId": int(parent_id), "rootCommentId": int(root_id),
+            })
+            ret_text = ";".join(str(r) for r in (resp or {}).get("ret") or [])
+            comment_id = str(((resp or {}).get("data") or {}).get("model", {}).get("commentId") or "")
+            if "SUCCESS" not in ret_text or not comment_id:
+                msg = ret_text or str(resp)[:150]
+                logger.info(f"[taobao_guanghe reply_comment] {work_id} 回复失败: {msg}")
+                return {"ok": False, "message": f"回复失败: {msg}"}
+            logger.info(
+                f"[taobao_guanghe reply_comment] {work_id} 回复成功 "
+                f"comment_id={comment_id} root={root_id}"
+            )
+            return {"ok": True, "comment_id": comment_id, "message": ""}
+        except Exception as e:
+            logger.info(f"[taobao_guanghe reply_comment] 回复失败: {e}")
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                if page is not None:
+                    try:
+                        await page.close()
+                        await context.close()
+                    except Exception:
+                        pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """以作者身份删除评论区下的一条评论（comment.delete，传 commentId）。
+
+        踩点实测：删除接口只需 commentId（不需要 targetId），可删自己的
+        评论与回复。
+        """
+        comment_id = str(comment_id or "").strip()
+        if not comment_id:
+            return {"ok": False, "message": "参数缺失（comment_id）"}
+        browser = None
+        page = None
+        context = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file, work_id or "0")
+            resp = await self._mtop_call(page, _GUANGHE_COMMENT_DELETE_API, {
+                "source": "guanghe", "mode": "0", "agentType": "",
+                "commentId": int(comment_id),
+            })
+            ret_text = ";".join(str(r) for r in (resp or {}).get("ret") or [])
+            model = ((resp or {}).get("data") or {}).get("model")
+            if "SUCCESS" not in ret_text or model is not True:
+                msg = ret_text or str(resp)[:150]
+                logger.info(
+                    f"[taobao_guanghe delete_comment] {comment_id} 删除失败: {msg}"
+                )
+                return {"ok": False, "message": f"删除失败: {msg}"}
+            logger.info(f"[taobao_guanghe delete_comment] {comment_id} 删除成功")
+            return {"ok": True, "message": ""}
+        except Exception as e:
+            logger.info(f"[taobao_guanghe delete_comment] 删除失败: {e}")
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                if page is not None:
+                    try:
+                        await page.close()
+                        await context.close()
+                    except Exception:
+                        pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     async def open_creator_center(self, cookie_file: str) -> None:
         cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))

@@ -2787,7 +2787,510 @@ class CsdnPlatform(BasePlatform):
             except Exception:
                 pass
 
+    # ------------------------------------------------------------------
+    # 作品评论（一键评论 / 评论同步）—— 踩点结论（2026-11-24 实测）
+    #   评论走博客前台老接口 blog.csdn.net/phoenix/web/v1/comment/*，
+    #   无 x-ca 签名（仅 X-Requested-With），但必须从 blog.csdn.net 同源页
+    #   发 fetch（页外直调被 WAF 静默挂起）。
+    #     list : POST /phoenix/web/v1/comment/list/{articleId}
+    #            ?page=1&size=50&fold=unfold&commentId=
+    #            data.list[] = {info:{commentId,parentId,postTime,content,
+    #            userName,nickName,avatar,digg,isTop,region}, sub:[楼中楼同构]}
+    #     add  : POST /phoenix/web/v1/comment/submit
+    #            body commentId=&content=&articleId=（回复时 commentId=目标评论）
+    #            实测 headless 与有头自动化均被风控 521「请进行安全验证」拦
+    #            截（人工过验证码后可用）→ supports_comment 仍为 True 但
+    #            自动化环境下大概率失败，错误信息如实透传。
+    #     del  : POST /phoenix/web/v1/comment/delete
+    #            body commentId=&articleId=&action_spm=1001.2101.3001.11995
+    #            （detail-*.js 前端源码提取；发评被风控阻断无法创建测试评论
+    #            实测，运行时失败信息如实透传）。
+    #   bizapi.csdn.net/comment/v1/pc/* 需 x-ca 签名，页内裸 fetch 401，弃用。
+    #   置顶：CSDN 博客评论无置顶能力（仅 B 站等平台有），supports_pin_comment=False。
+    # ------------------------------------------------------------------
+
+    supports_comment = True
+    supports_pin_comment = False
+    supports_delete_comment = True
+
+    CSDN_COMMENT_LIST_API = (
+        "https://blog.csdn.net/phoenix/web/v1/comment/list/{aid}"
+        "?page={page}&size={size}&fold=unfold&commentId="
+    )
+    CSDN_COMMENT_SUBMIT_API = "https://blog.csdn.net/phoenix/web/v1/comment/submit"
+    CSDN_COMMENT_DEL_API = "https://blog.csdn.net/phoenix/web/v1/comment/delete"
+    # 解析 work_id(articleId) → username 用：管理页文章列表（响应捕获，
+    # 同 list_works 模式，绕 x-ca 签名），用于 list_comments 的 is_author 判定
+    CSDN_COMMENT_ARTICLE_MANAGE_URL = "https://mp.csdn.net/mp_blog/manage/article"
+
+    async def _comment_page(self, cookie_file: str):
+        """打开 blog.csdn.net 首页作为同源 fetch 上下文。
+        返回 (browser, context, page)。调用方负责三层关闭。"""
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        context = await self.create_context(browser, storage_state=cookie_path)
+        page = await context.new_page()
+        await page.goto(
+            "https://blog.csdn.net/", wait_until="domcontentloaded", timeout=45000
+        )
+        await asyncio.sleep(2)
+        return browser, context, page
+
+    async def _comment_username(self, cookie_file: str, work_id: str) -> str:
+        """从创作中心文章管理列表解析 articleId → username（供 is_author）。
+
+        复用 list_works 的响应捕获模式（管理页接口走 x-ca 签名，页面自己
+        发签名请求，这里只监听 response）。最多翻 5 页，找不到返回空串，
+        不影响评论抓取主流程。
+        """
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                captured = []
+
+                def _on_response(resp):
+                    try:
+                        if (self.CSDN_ARTICLE_LIST_API in resp.url
+                                and resp.request.method == "GET"):
+                            asyncio.ensure_future(_absorb(resp))
+                    except Exception:
+                        pass
+
+                async def _absorb(resp):
+                    try:
+                        body = await resp.json()
+                    except Exception:
+                        return
+                    if isinstance(body, dict) and body.get("code") == 200:
+                        seg = body.get("data") or {}
+                        for it in seg.get("list") or []:
+                            captured.append(it)
+
+                page.on("response", _on_response)
+                try:
+                    await page.goto(
+                        self.CSDN_COMMENT_ARTICLE_MANAGE_URL,
+                        wait_until="domcontentloaded", timeout=30000,
+                    )
+                except Exception:
+                    pass
+                # 等首屏列表接口响应（最多 15s）
+                deadline = time.time() + 15
+                while time.time() < deadline and not captured:
+                    await asyncio.sleep(0.5)
+                deadline = time.time() + 15
+                while time.time() < deadline:
+                    if any(str(it.get("articleId") or "") == work_id
+                           for it in captured):
+                        break
+                    # 翻页让页面继续发签名请求
+                    try:
+                        btn = page.locator(self.CSDN_PAGER_NEXT_SEL).first
+                        if await btn.count() == 0 or not await btn.is_enabled():
+                            break
+                        await btn.click(timeout=5000)
+                    except Exception:
+                        break
+                    await asyncio.sleep(1)
+                for it in captured:
+                    if str(it.get("articleId") or "") == work_id:
+                        return str(it.get("username") or "")
+                return ""
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+        except Exception:
+            return ""
+        finally:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    async def _comment_fetch(page, js: str, arg, timeout: float = 30):
+        """页内 evaluate 带 asyncio 超时保护（WAF 会静默挂起直调请求）。"""
+        return await asyncio.wait_for(page.evaluate(js, arg), timeout)
+
+    @staticmethod
+    def _map_csdn_comment(info: dict, parent_id: str, username: str,
+                          reply_count: int = 0) -> dict:
+        """phoenix comment info → 契约字段。"""
+        region = str(info.get("region") or "").replace("IP：", "").replace("IP:", "")
+        uname = str(info.get("userName") or "")
+        return {
+            "comment_id": str(info.get("commentId") or ""),
+            "parent_id": parent_id,
+            "author": str(info.get("nickName") or info.get("userName") or ""),
+            "avatar": str(info.get("avatar") or ""),
+            "content": str(info.get("content") or ""),
+            "like_count": int(info.get("digg") or 0),
+            "reply_count": reply_count,
+            "publish_time": str(info.get("postTime") or ""),
+            "location": region,
+            "is_author": bool(username) and uname == username,
+            "pinned": bool(info.get("isTop")),
+        }
+
+    @staticmethod
+    def _csdn_comment_result(result) -> dict | None:
+        """页内 fetch 返回 'status|body' 字符串，解析为 dict 或 None。"""
+        if not isinstance(result, str) or "|" not in result:
+            return None
+        status, _, body = result.partition("|")
+        if status.strip() != "200":
+            return None
+        import json as _json
+        try:
+            return _json.loads(body)
+        except Exception:
+            return None
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """抓取文章评论区：blog.csdn.net 同源页内 fetch
+        POST /phoenix/web/v1/comment/list/{articleId}（无签名，仅需 cookie）。
+        楼中楼在每项的 sub 数组里（parentId=被回复评论 id）。"""
+        aid = (work_id or "").strip()
+        if not aid:
+            return []
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            username = ""
+            try:
+                username = await self._comment_username(cookie_file, aid)
+            except Exception:
+                pass
+
+            fetch_js = """
+                async ([aid, size]) => {
+                    const out = [];
+                    for (let p = 1; p <= 10; p++) {
+                        const resp = await fetch(
+                            'https://blog.csdn.net/phoenix/web/v1/comment/list/'
+                            + aid + '?page=' + p + '&size=' + size
+                            + '&fold=unfold&commentId=', {
+                            method: 'POST', credentials: 'include',
+                            headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                        });
+                        if (!resp.ok) return { code: resp.status, list: out };
+                        const j = await resp.json();
+                        if (j.code !== 200) return { code: j.code, message: j.message, list: out };
+                        const items = j.data?.list || [];
+                        out.push(...items);
+                        const pageCount = j.data?.pageCount || 1;
+                        if (p >= pageCount || !items.length) break;
+                    }
+                    return { code: 200, list: out };
+                }
+            """
+            result = await self._comment_fetch(page, fetch_js, [aid, 50])
+            if not isinstance(result, dict) or result.get("code") != 200:
+                logger.info(
+                    "[CSDN评论列表] %s 拉取失败: %s", aid, result
+                )
+                return []
+
+            username_s = str(username or "")
+            comments: list[dict] = []
+            for item in result.get("list", []):
+                info = item.get("info") or {}
+                subs = [s.get("info") or {} for s in (item.get("sub") or [])
+                        if isinstance(s, dict)]
+                comments.append(self._map_csdn_comment(
+                    info, "", username_s, reply_count=len(subs)))
+                for sub in subs:
+                    sub_parent = str(sub.get("parentId") or "")
+                    if not sub_parent or sub_parent == "0":
+                        sub_parent = comments[-1]["comment_id"]
+                    comments.append(self._map_csdn_comment(
+                        sub, sub_parent, username_s))
+                if len(comments) >= max(int(limit or 100), 1):
+                    break
+            logger.info("[CSDN评论列表] %s 抓到 %d 条评论", aid, len(comments))
+            return comments
+        except Exception as exc:
+            logger.info("[CSDN评论列表] list_comments 失败: %s", exc)
+            return []
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """在文章前台页通过评论区 DOM 真实提交（填 #comment_content → 点
+        .btn-comment-input，页面自己发 /phoenix/web/v1/comment/submit）。
+        注意：实测自动化环境（headless/有头）均被 CSDN 风控 521「请进行
+        安全验证」拦截，需人工过验证码；失败信息如实透传。平台不支持评论
+        置顶，pinned=True 时仅在 message 中说明。"""
+        aid = (work_id or "").strip()
+        if not aid or not (content or "").strip():
+            return {"ok": False, "comment_id": "", "pinned": False,
+                    "message": "参数缺失（work_id / content）"}
+        browser = None
+        try:
+            # 打开文章前台页（需要 username 拼前台 URL）
+            username = ""
+            try:
+                username = await self._comment_username(cookie_file, aid)
+            except Exception:
+                pass
+            if not username:
+                return {"ok": False, "comment_id": "", "pinned": False,
+                        "message": "无法解析文章前台 URL（管理列表未找到该文章）"}
+            cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+            browser = await self.create_browser(headless=True)
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+            await page.goto(
+                f"https://blog.csdn.net/{username}/article/details/{aid}",
+                wait_until="domcontentloaded", timeout=45000,
+            )
+            await asyncio.sleep(3)
+            # 打开评论抽屉（抽屉已开则不重复点击，否则点侧边栏入口并等待）
+            ta = None
+            for attempt in range(2):
+                try:
+                    already = await page.evaluate(
+                        """() => {
+                            const e = document.querySelector('#comment_content');
+                            return e ? !!e.offsetParent : false;
+                        }"""
+                    )
+                    if not already:
+                        await page.click(
+                            ".sidebar-item.go-side-comment", timeout=8000
+                        )
+                    await page.wait_for_selector(
+                        "#comment_content", state="visible", timeout=15000
+                    )
+                    ta = page.locator("#comment_content")
+                    break
+                except Exception:
+                    await asyncio.sleep(2)
+                    continue
+            if ta is None:
+                msg = ("评论发布失败: 评论区抽屉未打开（页面可能被 CSDN 风控"
+                       "「请进行安全验证」拦截，或页面结构变化/加载失败）")
+                logger.info("[CSDN发评论] %s 失败: %s", aid, msg)
+                return {"ok": False, "comment_id": "", "pinned": False,
+                        "message": msg}
+            await ta.click(timeout=8000)
+            await ta.fill(content.strip())
+            await asyncio.sleep(1)
+            # 提交并捕获 submit 响应
+            resp = None
+            try:
+                async with page.expect_response(
+                    lambda r: "comment/submit" in r.url, timeout=20000
+                ) as ri:
+                    await page.click(
+                        "#pcCommentSideBox input.btn-comment-input", timeout=8000
+                    )
+                resp = ri.value
+                if asyncio.iscoroutine(resp):
+                    resp = await resp
+            except Exception:
+                resp = None
+            if resp is None:
+                msg = "评论发布失败: 页面未发出提交请求（可能被风控/登录态失效）"
+                logger.info("[CSDN发评论] %s 失败: %s", aid, msg)
+                return {"ok": False, "comment_id": "", "pinned": False,
+                        "message": msg}
+            status = resp.status
+            try:
+                text = await resp.text()
+            except Exception:
+                text = ""
+            data = self._csdn_comment_result(f"{status}|{text}")
+            if status == 521 or data is None:
+                msg = (
+                    "评论发布失败: CSDN 风控拦截（HTTP %s「请进行安全验证」），"
+                    "需人工在浏览器过验证码后重试" % status
+                ) if status == 521 else (
+                    f"评论发布失败: HTTP {status} {text[:200]}")
+                logger.info("[CSDN发评论] %s 失败: %s", aid, msg)
+                return {"ok": False, "comment_id": "", "pinned": False,
+                        "message": msg}
+            comment_id = str(
+                (data.get("data") or {}).get("commentId")
+                or (data.get("data") or {}).get("comment_id") or ""
+            ) if isinstance(data.get("data"), dict) else ""
+            if data.get("code") != 200:
+                msg = str(data.get("message") or "评论发布失败")
+                logger.info("[CSDN发评论] %s 失败: %s", aid, msg)
+                return {"ok": False, "comment_id": "", "pinned": False,
+                        "message": msg}
+            logger.info(
+                "[CSDN发评论] %s 发布成功 comment_id=%s%s",
+                aid, comment_id, "（平台不支持置顶）" if pinned else "",
+            )
+            return {
+                "ok": True,
+                "comment_id": comment_id,
+                "pinned": False,
+                "message": "CSDN 不支持评论置顶" if pinned else "",
+            }
+        except Exception as exc:
+            logger.info("[CSDN发评论] post_comment 失败: %s", exc)
+            return {"ok": False, "comment_id": "", "pinned": False,
+                    "message": str(exc)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """blog.csdn.net 同源页内 fetch POST /phoenix/web/v1/comment/delete
+        删除评论（本人评论或本人文章下的评论）。端点与参数取自文章页前端
+        JS（detail-*.js）。注意：因发评被风控阻断无法创建测试评论实测，
+        失败信息如实透传。"""
+        aid = (work_id or "").strip()
+        cid = str(comment_id or "").strip()
+        if not aid or not cid:
+            return {"ok": False, "message": "参数缺失（work_id / comment_id）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            result = await self._comment_fetch(page, 
+                """
+                async ([aid, cid]) => {
+                    const body = new URLSearchParams({
+                        commentId: String(cid), articleId: String(aid),
+                        action_spm: '1001.2101.3001.11995',
+                    });
+                    const resp = await fetch(
+                        'https://blog.csdn.net/phoenix/web/v1/comment/delete', {
+                        method: 'POST', credentials: 'include',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-Requested-With': 'XMLHttpRequest',
+                        },
+                        body: body.toString(),
+                    });
+                    const t = await resp.text();
+                    return resp.status + '|' + t.slice(0, 500);
+                }
+                """,
+                [aid, cid],
+            )
+            data = self._csdn_comment_result(result)
+            if data is None:
+                status = str(result).split("|", 1)[0] if isinstance(result, str) else "?"
+                msg = (f"删除失败: HTTP {status}（可能被 CSDN 风控拦截）"
+                       ) if status == "521" else (
+                    f"删除失败: HTTP {status} {str(result)[:200]}")
+                logger.info("[CSDN删评论] %s cid=%s 失败: %s", aid, cid, msg)
+                return {"ok": False, "message": msg}
+            if data.get("code") != 200:
+                msg = str(data.get("message") or "删除失败")
+                logger.info("[CSDN删评论] %s cid=%s 失败: %s", aid, cid, msg)
+                return {"ok": False, "message": msg}
+            logger.info("[CSDN删评论] %s cid=%s 删除成功", aid, cid)
+            return {"ok": True, "message": ""}
+        except Exception as exc:
+            msg = str(exc) or "请求超时/被 WAF 挂起"
+            logger.info("[CSDN删评论] delete_comment 失败: %s", exc)
+            return {"ok": False, "message": msg}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """回复评论：POST /phoenix/web/v1/comment/submit，body commentId=
+        被回复的评论 id（楼中楼时传 parent_id，缺省回退 root_id）。"""
+        aid = (work_id or "").strip()
+        root_id = str(root_id or "").strip()
+        parent_id = str(parent_id or "").strip()
+        target = parent_id or root_id
+        if not aid or not target or not (content or "").strip():
+            return {"ok": False, "comment_id": "",
+                    "message": "参数缺失（work_id / root_id / parent_id / content）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            result = await self._comment_fetch(page, 
+                """
+                async ([aid, target, content]) => {
+                    const body = new URLSearchParams({
+                        commentId: String(target), content: content,
+                        articleId: String(aid),
+                        action_spm: '1001.2101.3001.4227',
+                    });
+                    const resp = await fetch(
+                        'https://blog.csdn.net/phoenix/web/v1/comment/submit', {
+                        method: 'POST', credentials: 'include',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'X-Requested-With': 'XMLHttpRequest',
+                        },
+                        body: body.toString(),
+                    });
+                    const t = await resp.text();
+                    return resp.status + '|' + t.slice(0, 800);
+                }
+                """,
+                [aid, target, content.strip()],
+            )
+            data = self._csdn_comment_result(result)
+            if data is None:
+                status = str(result).split("|", 1)[0] if isinstance(result, str) else "?"
+                msg = ("回复失败: CSDN 风控拦截（HTTP %s「请进行安全验证」）"
+                       ) % status if status == "521" else (
+                    f"回复失败: HTTP {status} {str(result)[:200]}")
+                logger.info("[CSDN回复评论] %s target=%s 失败: %s",
+                            aid, target, msg)
+                return {"ok": False, "comment_id": "", "message": msg}
+            comment_id = str(
+                (data.get("data") or {}).get("commentId")
+                or (data.get("data") or {}).get("comment_id") or ""
+            ) if isinstance(data.get("data"), dict) else ""
+            if data.get("code") != 200:
+                msg = str(data.get("message") or "回复失败")
+                logger.info("[CSDN回复评论] %s target=%s 失败: %s",
+                            aid, target, msg)
+                return {"ok": False, "comment_id": "", "message": msg}
+            logger.info("[CSDN回复评论] %s 回复成功 comment_id=%s root=%s",
+                        aid, comment_id, root_id)
+            return {"ok": True, "comment_id": comment_id, "message": ""}
+        except Exception as exc:
+            msg = str(exc) or "请求超时/被 WAF 挂起"
+            logger.info("[CSDN回复评论] reply_comment 失败: %s", exc)
+            return {"ok": False, "comment_id": "", "message": msg}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
 
 # ---------------------------------------------------------------------------
 # 素材方向查询已移除：CSDN 固定使用横版封面，不再需要按视频方向选择。
 # ---------------------------------------------------------------------------
+

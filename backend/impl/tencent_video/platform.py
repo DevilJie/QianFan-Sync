@@ -1230,3 +1230,414 @@ class TencentVideoPlatform(BasePlatform):
             return []
         finally:
             await browser.close()
+
+    # ------------------------------------------------------------------
+    # 作品评论（创作中心「互动管理-评论管理」mp.v.qq.com/1/interact）
+    # ------------------------------------------------------------------
+
+    # 2026-11 实机踩点：创作中心评论管理页有发评框/评论列表，底座接口均在
+    # access.v.qq.com（需会话令牌 g_vstk，从页面自身请求提取，同 list_works）：
+    #   列表 Interaction/GetCommentList（GET，context 游标翻页）
+    #   发评   PublishService/doPublishAction（POST JSON → data.feed.base_info.feed_id）
+    #   回复   PublishService/doPostCommentAction（POST JSON，parent_id=目标评论）
+    #   删除   PublishService/doDeleteAction（POST JSON，delete_type=2+comment_key）
+    #   置顶   Interaction/SetCommentTop（GET）
+    # 注意：发评/回复提交后进入平台审核（"评论成功，审核通过后外网可见"），
+    # 审核通过前列表与前台均不展示——这是平台行为，非实现缺陷。
+    supports_comment = True
+    supports_pin_comment = True
+    supports_delete_comment = True
+
+    _INTERACT_URL = "https://mp.v.qq.com/1/interact"
+    # 平台前端硬编码的应用签名（scratch/probe_tx_comment12 抓取自创作中心 bundle）
+    _PB_SIGN = (
+        "?vappid=70930403"
+        "&vsecret=ce4b714af67c9337211ea0f13264c840433a701fe83aa5eb"
+    )
+    _PB_COMMENT_BASE = (
+        "https://access.v.qq.com/com.tencent.qqlive.protocol.pb.PublishService"
+        "/doPublishAction" + _PB_SIGN
+    )
+    _PB_REPLY_BASE = (
+        "https://access.v.qq.com/com.tencent.qqlive.protocol.pb.PublishService"
+        "/doPostCommentAction" + _PB_SIGN
+    )
+    _PB_DELETE_BASE = (
+        "https://access.v.qq.com/com.tencent.qqlive.protocol.pb.PublishService"
+        "/doDeleteAction" + _PB_SIGN
+    )
+    _COMMENT_LIST_API = (
+        "https://access.v.qq.com/trpc.creator_center.message_notification.Interaction/GetCommentList"
+    )
+    _COMMENT_TOP_API = (
+        "https://access.v.qq.com/trpc.creator_center.message_notification.Interaction/SetCommentTop"
+    )
+
+    async def _comment_session(self, cookie_file: str):
+        """打开已登录的评论管理页，返回 (browser, context, page, g_vstk, vcuid)。
+
+        与 list_works 同款：监听页面自身请求提取会话令牌 g_vstk；未捕获 =
+        未登录/cookie 失效 → raise RuntimeError，由调用方转为失败返回值。
+        """
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            page = await context.new_page()
+
+            req_url = None
+            got = asyncio.Event()
+
+            def _on_request(request):
+                nonlocal req_url
+                if "g_vstk=" in request.url and not got.is_set():
+                    req_url = request.url
+                    got.set()
+
+            page.on("request", _on_request)
+            await page.goto(self._INTERACT_URL, wait_until="domcontentloaded", timeout=30000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(got.wait(), timeout=15)
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"未捕获会话请求(未登录/cookie 失效), url={page.url}")
+            g_vstk = req_url.split("g_vstk=")[-1].split("&")[0]
+            vcuid = await page.evaluate(
+                "document.cookie.match(/vcuid=([^;]+)/)?.[1] || ''")
+            return browser, context, page, g_vstk, vcuid
+        except Exception:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            raise
+
+    @staticmethod
+    def _fmt_comment_time(ts) -> str:
+        """评论时间戳（平台返回毫秒数字/字符串，踩点见 bundle time_stamp 字段）
+        → 'YYYY-MM-DD HH:MM'；非时间戳文本原样返回。"""
+        try:
+            from datetime import datetime, timezone, timedelta  # noqa: PLC0415
+
+            n = int(str(ts).strip())
+            if n <= 0:
+                return ""
+            if n < 10 ** 12:  # 秒 → 毫秒
+                n *= 1000
+            return datetime.fromtimestamp(
+                n / 1000, tz=timezone(timedelta(hours=8))
+            ).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError):
+            return str(ts or "").strip()
+
+    @staticmethod
+    def _map_comment(item: dict, parent_id: str, vcuid: str) -> dict:
+        """GetCommentList 单条评论 → 契约字段（字段名实证自创作中心 bundle
+        解析逻辑：comment_id/text/time_stamp/like_num/sub_comment_num/
+        comment_user{vuid,user_name,user_head,is_author}/is_top）。"""
+        user = item.get("comment_user") or {}
+        cid = str(item.get("comment_id") or "")
+        is_author = bool(user.get("is_author")) or (
+            bool(vcuid) and str(user.get("vuid") or "") == vcuid)
+        sub = item.get("sub_comments") or {}
+        return {
+            "comment_id": cid,
+            "parent_id": parent_id,
+            "author": (user.get("user_name") or "").strip(),
+            "avatar": (user.get("user_head") or "").strip(),
+            "content": (item.get("text") or item.get("content") or "").strip(),
+            "like_count": int(item.get("like_num") or 0),
+            "reply_count": int(item.get("sub_comment_num") or 0),
+            "publish_time": TencentVideoPlatform._fmt_comment_time(item.get("time_stamp")),
+            "location": "",  # 腾讯视频评论无 IP 归属地字段
+            "is_author": is_author,
+            "pinned": bool(item.get("is_top")),
+            "_sub_comments": sub.get("comments") or [],
+        }
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """抓取作品评论区（创作中心 Interaction/GetCommentList，含楼中楼一级）。
+
+        注意：仅返回审核通过的评论（平台口径）；cookie 失效/失败 → []。
+        """
+        vid = (work_id or "").strip()
+        if not vid:
+            return []
+        browser = None
+        try:
+            browser, context, page, g_vstk, vcuid = await self._comment_session(cookie_file)
+
+            raw = await page.evaluate(
+                """async ([api, g_vstk, vid, limit]) => {
+                    const items = [];
+                    let context = '';
+                    for (let i = 0; i < 10 && items.length < limit; i++) {
+                        const url = `${api}?g_vstk=${g_vstk}&refer=vcc_web&size=50`
+                            + `&id=${vid}&vid=${vid}&context=${encodeURIComponent(context)}`
+                            + `&comment_type=0&order_type=0&origin=1`;
+                        const j = await (await fetch(url, {credentials: 'include'})).json();
+                        if (!j || Number(j.ret) !== 0) return {ret: j && j.ret, msg: j && j.msg,
+                            comments: items, sub: {}};
+                        const d = j.data || {};
+                        items.push(...(d.comments || []));
+                        // 楼中楼一级（sub_comments 已随条目内联返回）
+                        for (const c of d.comments || []) {
+                            if (c.sub_comments && (c.sub_comments.comments || []).length) {
+                                for (const s of c.sub_comments.comments) {
+                                    items.push({__sub_of: c.comment_id, ...s});
+                                }
+                            }
+                        }
+                        if (!d.has_next || !d.context) break;
+                        context = d.context;
+                    }
+                    return {ret: 0, comments: items};
+                }""",
+                [self._COMMENT_LIST_API, g_vstk, vid, int(limit or 100)],
+            )
+            if not isinstance(raw, dict) or raw.get("ret") not in (0, "0"):
+                msg = (raw or {}).get("msg", "未知错误") if isinstance(raw, dict) else str(raw)
+                logger.info(f"[腾讯视频评论列表] {vid} 拉取失败: {msg}")
+                return []
+
+            out: list[dict] = []
+            for item in raw.get("comments", []):
+                sub_of = str(item.pop("__sub_of", "") or "")
+                out.append(self._map_comment(item, sub_of, vcuid))
+            logger.info(f"[腾讯视频评论列表] {vid} 抓到 {len(out)} 条评论")
+            return out
+        except Exception as e:
+            logger.info(f"[腾讯视频评论列表] {vid} 抓取失败: {e}")
+            return []
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    async def _pb_post(page, js: str, args: list, retries: int = 3):
+        """执行页内 fetch POST JS；平台网关偶发直接断连（浏览器侧 TypeError:
+        Failed to fetch），对网络级错误重试，业务错误不重试。"""
+        result = None
+        for attempt in range(retries):
+            result = await page.evaluate(js, args)
+            if isinstance(result, dict) and not result.get("__net_error__"):
+                return result
+            await asyncio.sleep(2 * (attempt + 1))
+        return result if isinstance(result, dict) else {"__net_error__": True}
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """以作者身份发评（doPublishAction，POST JSON），成功返回平台评论
+        feed_id；pinned=True 时再调 Interaction/SetCommentTop 置顶。
+
+        注意：发评成功后进入平台审核（"审核通过后外网可见"），feed_id 仍会返回，
+        可用于后续删除/置顶。置顶失败不影响发评结果（仿 B站：ok=True + message）。
+        """
+        vid = (work_id or "").strip()
+        if not vid or not (content or "").strip():
+            return {"ok": False, "message": "参数缺失（work_id / content）"}
+        browser = None
+        try:
+            browser, context, page, g_vstk, vcuid = await self._comment_session(cookie_file)
+            result = await self._pb_post(page, """async ([base, vid, message, g_vstk]) => {
+                    try {
+                        const resp = await fetch(
+                            base + '&g_vstk=' + g_vstk + '&refer=vcc_web',
+                            {method: 'POST', credentials: 'include',
+                             headers: {'Content-Type': 'application/json',
+                                       'Accept': 'application/json',
+                                       'creator-status': '1'},
+                             body: JSON.stringify({base_info: {
+                                 data_key: `lid=&cid=&vid=${vid}&type=0`,
+                                 seq: '1617335010022', from: 108, content: message},
+                                 publish_type: 2})});
+                        return {status: resp.status,
+                                body: (await resp.text()).slice(0, 20000)};
+                    } catch (e) { return {__net_error__: true, error: String(e)}; }
+                }""",
+                [self._PB_COMMENT_BASE, vid, content.strip(), g_vstk])
+            if result.get("__net_error__"):
+                msg = f"网络错误: {result.get('error', '')}"
+                logger.info(f"[腾讯视频发评论] {vid} 失败: {msg}")
+                return {"ok": False, "message": msg}
+            body = {}
+            try:
+                body = json.loads(result.get("body") or "{}")
+            except (ValueError, TypeError):
+                pass
+            # 注意：doPublishAction/doPostCommentAction/doDeleteAction 成功响应
+            # 均可能无 ret 字段（仅 data），缺省按 0（成功）处理
+            if result.get("status") != 200 or int(body.get("ret", 0)) != 0:
+                msg = body.get("msg") or (
+                    f"HTTP {result.get('status')}: {str(result.get('body'))[:150]}")
+                logger.info(f"[腾讯视频发评论] {vid} 失败: {msg}")
+                return {"ok": False, "message": f"发评失败: {msg}"}
+            feed_id = str((((body.get("data") or {}).get("feed") or {})
+                           .get("base_info") or {}).get("feed_id") or "")
+            logger.info(f"[腾讯视频发评论] {vid} 发布成功 feed_id={feed_id}")
+
+            if pinned and feed_id:
+                top = await page.evaluate(
+                    """async ([api, vid, g_vstk, commentId]) => {
+                        const url = `${api}?g_vstk=${g_vstk}&refer=vcc_web`
+                            + `&id=${vid}&vid=${vid}&comment_id=${commentId}&origin=1`;
+                        const j = await (await fetch(url, {credentials: 'include'})).json();
+                        return {code: j && j.code, msg: j && j.msg};
+                    }""",
+                    [self._COMMENT_TOP_API, vid, g_vstk, feed_id],
+                )
+                if isinstance(top, dict) and str(top.get("code")) == "0":
+                    logger.info(f"[腾讯视频发评论] {vid} 置顶成功 feed_id={feed_id}")
+                    return {"ok": True, "comment_id": feed_id, "pinned": True, "message": ""}
+                msg = (top or {}).get("msg", "未知错误") if isinstance(top, dict) else str(top)
+                return {"ok": True, "comment_id": feed_id, "pinned": False,
+                        "message": f"评论已发布，但置顶失败: {msg}"}
+            return {"ok": True, "comment_id": feed_id, "pinned": False, "message": ""}
+        except Exception as e:
+            logger.info(f"[腾讯视频发评论] {vid} 发布失败: {e}")
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """删除评论（doDeleteAction，delete_type=2，comment_key=作品 data_key）。
+
+        作者可删除自己作品评论区下的评论（含楼中楼，传对应 feed_id）。
+        """
+        vid = (work_id or "").strip()
+        cid = str(comment_id or "").strip()
+        if not vid or not cid:
+            return {"ok": False, "message": "参数缺失（work_id / comment_id）"}
+        browser = None
+        try:
+            browser, context, page, g_vstk, vcuid = await self._comment_session(cookie_file)
+            if not vcuid:
+                return {"ok": False, "message": "cookie 中无 vcuid（创作者身份标识）"}
+            result = await self._pb_post(page, """async ([base, vid, feedId, vcuid, g_vstk]) => {
+                    try {
+                        const resp = await fetch(
+                            base + '&g_vstk=' + g_vstk + '&refer=vcc_web',
+                            {method: 'POST', credentials: 'include',
+                             headers: {'Content-Type': 'application/json',
+                                       'Accept': 'application/json',
+                                       'creator-status': '1',
+                                       'trpc-trans-info': JSON.stringify(
+                                           {vcuid: btoa(vcuid), status: btoa('1')})},
+                             body: JSON.stringify({delete_type: 2, delete_id: feedId,
+                                 request_params: {comment_key: `lid=&cid=&vid=${vid}&type=0`}})});
+                        return {status: resp.status,
+                                body: (await resp.text()).slice(0, 20000)};
+                    } catch (e) { return {__net_error__: true, error: String(e)}; }
+                }""",
+                [self._PB_DELETE_BASE, vid, cid, vcuid, g_vstk])
+            if result.get("__net_error__"):
+                msg = f"网络错误: {result.get('error', '')}"
+                logger.info(f"[腾讯视频删评论] {vid} feed_id={cid} 失败: {msg}")
+                return {"ok": False, "message": msg}
+            body = {}
+            try:
+                body = json.loads(result.get("body") or "{}")
+            except (ValueError, TypeError):
+                pass
+            # 注意：doPublishAction/doPostCommentAction/doDeleteAction 成功响应
+            # 均可能无 ret 字段（仅 data），缺省按 0（成功）处理
+            if result.get("status") != 200 or int(body.get("ret", 0)) != 0:
+                msg = body.get("msg") or (
+                    f"HTTP {result.get('status')}: {str(result.get('body'))[:150]}")
+                logger.info(f"[腾讯视频删评论] {vid} feed_id={cid} 失败: {msg}")
+                return {"ok": False, "message": f"删除失败: {msg}"}
+            logger.info(f"[腾讯视频删评论] {vid} feed_id={cid} 删除成功")
+            return {"ok": True, "message": ""}
+        except Exception as e:
+            logger.info(f"[腾讯视频删评论] {vid} 删除失败: {e}")
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """回复评论（doPostCommentAction，parent_id=目标评论 feed_id）。
+
+        平台接口只需 parent_id（root_id 传参保留契约兼容）；回复同样进入审核，
+        平台未在响应中返回新回复 ID（实测 comment_feed 为 null）→ comment_id 为空。
+        """
+        vid = (work_id or "").strip()
+        parent = str(parent_id or "").strip()
+        if not vid or not parent or not (content or "").strip():
+            return {"ok": False, "message": "参数缺失（work_id / parent_id / content）"}
+        browser = None
+        try:
+            browser, context, page, g_vstk, vcuid = await self._comment_session(cookie_file)
+            result = await self._pb_post(page, """async ([base, parent, message, g_vstk]) => {
+                    try {
+                        const resp = await fetch(
+                            base + '&g_vstk=' + g_vstk + '&refer=vcc_web',
+                            {method: 'POST', credentials: 'include',
+                             headers: {'Content-Type': 'application/json',
+                                       'Accept': 'application/json',
+                                       'creator-status': '1'},
+                             body: JSON.stringify({base_info: {
+                                 data_key: 'lid=&cid=&vid=&type=0',
+                                 seq: '1617335010022', from: 108, content: message},
+                                 parent_id: parent})});
+                        return {status: resp.status,
+                                body: (await resp.text()).slice(0, 20000)};
+                    } catch (e) { return {__net_error__: true, error: String(e)}; }
+                }""",
+                [self._PB_REPLY_BASE, parent, content.strip(), g_vstk])
+            if result.get("__net_error__"):
+                msg = f"网络错误: {result.get('error', '')}"
+                logger.info(f"[腾讯视频回评论] {vid} parent={parent} 失败: {msg}")
+                return {"ok": False, "message": msg}
+            body = {}
+            try:
+                body = json.loads(result.get("body") or "{}")
+            except (ValueError, TypeError):
+                pass
+            # 注意：doPublishAction/doPostCommentAction/doDeleteAction 成功响应
+            # 均可能无 ret 字段（仅 data），缺省按 0（成功）处理
+            if result.get("status") != 200 or int(body.get("ret", 0)) != 0:
+                msg = body.get("msg") or (
+                    f"HTTP {result.get('status')}: {str(result.get('body'))[:150]}")
+                logger.info(f"[腾讯视频回评论] {vid} parent={parent} 失败: {msg}")
+                return {"ok": False, "message": f"回复失败: {msg}"}
+            feed_id = str((((body.get("data") or {}).get("comment_feed") or {})
+                           .get("base_info") or {}).get("feed_id") or "")
+            logger.info(
+                f"[腾讯视频回评论] {vid} 回复提交成功 parent={parent} feed_id={feed_id or '(审核中未返回)'}")
+            return {
+                "ok": True,
+                "comment_id": feed_id,
+                "message": "" if feed_id else "回复已提交（平台审核中，未返回回复ID）",
+            }
+        except Exception as e:
+            logger.info(f"[腾讯视频回评论] {vid} 回复失败: {e}")
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass

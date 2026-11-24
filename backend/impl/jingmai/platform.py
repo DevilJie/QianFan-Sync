@@ -586,3 +586,59 @@ class JingmaiPlatform(BasePlatform):
             if len(works) >= limit:
                 break
         return works
+
+    # ------------------------------------------------------------------
+    # 作品评论 — 平台不支持（踩点 2026-11-24，诚实降级）
+    # ------------------------------------------------------------------
+
+    # 踩点结论（有效账号 50 时尚小虹小店，5 个已上线作品）：
+    # 1. 京麦创作中心 SPA（dr.jd.com/jm/#/n/...）无任何评论管理入口：
+    #    侧边栏/菜单/内容行操作列（编辑/置顶/获得更多流量/删除）均无「评论」；
+    #    猜测路由 comment.html / comment-list.html / comment-manage.html 均为
+    #    SPA 兜底页（渲染默认首页），/n/comment.html 直接 404。
+    # 2. 内容管理页（content-list.html?platform=jm-pop）只发
+    #    contentArticleList 一个业务接口，无任何含 comment 的请求；
+    #    条目仅有 commentCount 统计字段。
+    # 3. 作品前台在京东 App 内（逛-竖版视频），无 Web 前台页：
+    #    guang.jd.com / wq.jd.com 逛路由均 404/403。App 评论接口
+    #    走 api.m.jd.com 且需 h5st 签名（同 contentArticleList，无法自造直调，
+    #    也没有宿主页可走"响应捕获"路线）。
+    # 故：京东逛内容的评论仅存在于 App 端，无创作者评论管理能力。
+    supports_comment = False
+    supports_pin_comment = False
+    supports_delete_comment = False
+
+    # 不支持评论时的统一失败原因（契约要求返回失败 dict，不抛异常）
+    _COMMENT_UNSUPPORTED_MSG = (
+        "京东京麦(逛内容)不支持评论管理：评论仅存在于京东App内，"
+        "创作中心无评论管理入口，App评论接口需h5st签名无法直接调用"
+    )
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """平台不支持抓取评论区（见 supports_comment 上方踩点结论），返回 []。"""
+        logger.info(f"[jingmai list_comments] 不支持: {self._COMMENT_UNSUPPORTED_MSG}")
+        return []
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """平台不支持作者发评（见 supports_comment 上方踩点结论），返回失败 dict。"""
+        logger.info(f"[jingmai post_comment] 不支持: {self._COMMENT_UNSUPPORTED_MSG}")
+        return {"ok": False, "message": self._COMMENT_UNSUPPORTED_MSG}
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """平台不支持回复评论（见 supports_comment 上方踩点结论），返回失败 dict。"""
+        logger.info(f"[jingmai reply_comment] 不支持: {self._COMMENT_UNSUPPORTED_MSG}")
+        return {"ok": False, "message": self._COMMENT_UNSUPPORTED_MSG}
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """平台不支持删除评论（见 supports_comment 上方踩点结论），返回失败 dict。"""
+        logger.info(f"[jingmai delete_comment] 不支持: {self._COMMENT_UNSUPPORTED_MSG}")
+        return {"ok": False, "message": self._COMMENT_UNSUPPORTED_MSG}

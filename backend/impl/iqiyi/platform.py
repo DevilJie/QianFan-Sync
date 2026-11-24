@@ -6,6 +6,7 @@ Publish URL: https://creator.iqiyi.com/publish/video/wemedia
 """
 
 import asyncio
+import json
 import threading
 import time
 from pathlib import Path
@@ -1263,3 +1264,490 @@ class IqiyiPlatform(BasePlatform):
             return []
         finally:
             await browser.close()
+
+    # ------------------------------------------------------------------
+    # 作品评论（一键评论 / 评论同步）
+    #
+    # 踩点结论（2026-11，scratch/probe_iqiyi_comment*.py）：
+    #   - 评论接口在 sns-comment.iqiyi.com/v3/comment/（无 CORS，页面内 JSONP
+    #     callback 调用，业务侧 business_type=17）：
+    #     读: get_comments.action / get_second_comments.action（楼中楼）
+    #         get_bulk_count_data.action（计数）
+    #     写: publish.action（发评/回复，reply_id=目标评论）、
+    #         delete_comment.action（删评，reply_id=评论ID）
+    #   - 写接口需要 authcookie（getLoginInfo 登录态）+ getSign 签名。
+    #     getSign 是站点 webpack 模块 50855 导出的函数，www.iqiyi.com 首页即
+    #     存在该模块，因此统一在首页页内 hook webpack require 取 getSign 现算。
+    #   - 置顶：前台组件与创作者中心均未发现任何置顶/推荐评论的写接口
+    #     （internal/get_top_comments 仅内部读），supports_pin_comment=False。
+    # ------------------------------------------------------------------
+
+    supports_comment = True
+    supports_pin_comment = False
+    supports_delete_comment = True
+
+    _COMMENT_HOME_URL = "https://www.iqiyi.com/"
+    _COMMENT_SNS_BASE = "https://sns-comment.iqiyi.com/v3/comment/"
+    _COMMENT_SIGN_KEY = "rNCRezUM1eds69OC"
+
+    # 页内公共 JS：hook webpack 取 getSign + getLoginInfo，并把
+    # JSONP/签名工具挂到 window.__qfsync_boot（函数无法跨 evaluate 返回，
+    # 只能常驻页内供后续 evaluate 调用）
+    _COMMENT_BOOT_JS = """
+        () => {
+            const reqs = [];
+            for (const k of Object.keys(window)
+                    .filter(k => /^webpackChunk/.test(k))) {
+                try {
+                    window[k].push([[Math.random() + 'hook'], {},
+                        (req) => reqs.push(req)]);
+                } catch (e) {}
+            }
+            let getSign = null, authcookie = '', uid = '';
+            for (const req of reqs) {
+                try {
+                    const m = req(50855);
+                    if (m && typeof m.getSign === 'function') {
+                        getSign = m.getSign;
+                        break;
+                    }
+                } catch (e) {}
+            }
+            for (const req of reqs) {
+                let done = false;
+                for (const id of Object.keys(req.m)) {
+                    let src = '';
+                    try { src = req.m[id].toString(); } catch (e) { continue; }
+                    if (/getLoginInfo\\s*[:=]/.test(src) && /authcookie/.test(src)) {
+                        try {
+                            const m = req(id);
+                            if (m && typeof m.getLoginInfo === 'function') {
+                                const li = m.getLoginInfo() || {};
+                                authcookie = li.authcookie || '';
+                                uid = String(li.uid || '');
+                                done = true;
+                            }
+                        } catch (e) {}
+                        break;
+                    }
+                }
+                if (done) break;
+            }
+            if (!getSign) return {error: '未找到 getSign 模块（页面结构变化?）'};
+
+            const jsonp = (url) => new Promise((resolve) => {
+                const cb = 'qfsync_cb_' + Math.random().toString(36).slice(2);
+                const s = document.createElement('script');
+                const t = setTimeout(() => { cleanup(); resolve({__err: 'timeout'}); }, 15000);
+                function cleanup() {
+                    clearTimeout(t); s.remove();
+                    try { delete window[cb]; } catch (e) {}
+                }
+                window[cb] = (data) => { cleanup(); resolve(data); };
+                s.src = url + '&callback=' + cb;
+                s.onerror = () => { cleanup(); resolve({__err: 'script error'}); };
+                document.head.appendChild(s);
+            });
+            const signed = (params) => {
+                const p = {...params};
+                for (const k of Object.keys(p)) {
+                    if (p[k] === '' || p[k] == null) delete p[k];
+                }
+                p.sign = getSign(p, __SIGN_KEY__, -1, true);
+                return Object.entries(p)
+                    .map(([k, v]) => k + '=' + encodeURIComponent(String(v)))
+                    .join('&');
+            };
+            window.__qfsync_boot = {
+                authcookie: authcookie,
+                uid: uid,
+                snsGet: async (path, params) =>
+                    jsonp(__SNS_BASE__ + path + '?' + signed(params)),
+            };
+            return {authcookie, uid};
+        }
+    """
+
+    async def _comment_page(self, cookie_file: str):
+        """打开 www.iqiyi.com 首页并注入评论接口工具，返回
+        (browser, context, page, boot)。boot = {authcookie, uid}。
+        调用方负责关闭 browser。"""
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                await page.goto(self._COMMENT_HOME_URL,
+                                wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=15000)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+                boot = await page.evaluate(
+                    self._COMMENT_BOOT_JS.replace("__SIGN_KEY__",
+                                                  json.dumps(self._COMMENT_SIGN_KEY))
+                    .replace("__SNS_BASE__", json.dumps(self._COMMENT_SNS_BASE))
+                )
+                if not isinstance(boot, dict):
+                    raise RuntimeError(f"页内工具初始化失败: {boot!r}")
+                return browser, context, page, boot
+            except Exception:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                raise
+        except Exception:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            raise
+
+    @staticmethod
+    def _fmt_comment_time(ts) -> str:
+        try:
+            from datetime import datetime, timezone, timedelta
+            return datetime.fromtimestamp(
+                int(ts), tz=timezone(timedelta(hours=8))
+            ).strftime("%Y-%m-%d %H:%M")
+        except (ValueError, TypeError, OSError):
+            return ""
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """抓取视频评论区：页内 JSONP get_comments.action（无需登录态）。
+
+        work_id 为爱奇艺 qipuId（即 list_works 返回的 tvid）。按时间倒序
+        翻页（last_id 链式游标，page_size 上限 40），楼中楼走
+        get_second_comments.action。置顶/热门评论（data.hot + isGood）
+        合并进列表并标记 pinned。
+        """
+        work_id = str(work_id or "").strip()
+        if not work_id:
+            return []
+        limit = max(int(limit or 100), 1)
+        browser = None
+        try:
+            browser, context, page, boot = await self._comment_page(cookie_file)
+            if boot.get("error"):
+                logger.info("[iqiyi list_comments] %s", boot["error"])
+                return []
+
+            raw = await page.evaluate(
+                """async ([tvId, maxItems, authcookie]) => {
+                    const snsGet = window.__qfsync_boot.snsGet;
+                    const common = {
+                        business_type: '17', agenttype: '118',
+                        agentversion: '9.11.5',
+                        authcookie: authcookie || '',
+                    };
+                    const out = [];
+                    let hotIds = [];
+                    let lastId = '0';
+                    for (let i = 0; i < 10 && out.length < maxItems; i++) {
+                        const r = await snsGet('get_comments.action', {
+                            content_id: tvId, types: 'time',
+                            last_id: lastId,
+                            page_size: String(Math.min(40, maxItems)),
+                            ...common,
+                        });
+                        if (!r || r.__err || r.code !== 'A00000') {
+                            return {error: (r && (r.msg || r.__err)) || '接口失败'};
+                        }
+                        const d = r.data || {};
+                        hotIds = (d.hot || []).map(c => String(c.id));
+                        const cs = d.comments || [];
+                        for (const c of cs) out.push(c);
+                        if (!cs.length) break;
+                        lastId = String(cs[cs.length - 1].id);
+                        const total = Number(d.totalCount || 0);
+                        if (total && out.length >= total) break;
+                    }
+                    // 楼中楼（有回复的顶级评论）
+                    for (const c of out) {
+                        if (Number(c.replyCount || 0) > 0) {
+                            const r = await snsGet('get_second_comments.action', {
+                                content_id: tvId, reply_id: String(c.id),
+                                last_id: '0', page_size: '20', ...common,
+                            });
+                            if (r && r.code === 'A00000') {
+                                c.__replies = (r.data && r.data.comments)
+                                    || (r.data && r.data.replies) || [];
+                            }
+                        }
+                    }
+                    return {comments: out, hotIds};
+                }""",
+                [work_id, limit, str(boot.get("authcookie") or "")],
+            )
+            if not isinstance(raw, dict) or raw.get("error"):
+                logger.info(
+                    "[iqiyi list_comments] %s 拉取失败: %s",
+                    work_id, (raw or {}).get("error") if isinstance(raw, dict) else raw,
+                )
+                return []
+
+            uid_s = str(boot.get("uid") or "")
+            hot_ids = set(raw.get("hotIds") or [])
+            comments: list[dict] = []
+
+            def _map(c, parent_id):
+                cid = str(c.get("id") or "")
+                cu = c.get("userInfo") or {}
+                pinned = bool(c.get("isGood") or c.get("isPublisherRecom")
+                              or cid in hot_ids)
+                return {
+                    "comment_id": cid,
+                    "parent_id": parent_id,
+                    "author": str(cu.get("uname") or ""),
+                    "avatar": str(cu.get("icon") or ""),
+                    "content": str(c.get("content") or ""),
+                    "like_count": int(c.get("likes") or 0),
+                    "reply_count": int(c.get("replyCount") or 0),
+                    "publish_time": self._fmt_comment_time(c.get("addTime")),
+                    "location": str(c.get("location") or ""),
+                    "is_author": bool(uid_s) and str(cu.get("uid") or "") == uid_s,
+                    "pinned": pinned,
+                }
+
+            for c in raw.get("comments") or []:
+                comments.append(_map(c, ""))
+                for rc in (c.get("__replies") or []):
+                    comments.append(_map(rc, str(c.get("id") or "")))
+
+            logger.info("[iqiyi list_comments] %s 抓到 %d 条评论", work_id, len(comments))
+            return comments
+        except Exception as e:
+            logger.info("[iqiyi list_comments] 抓取失败: %s", e)
+            return []
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def _ensure_comment_auth(self, page, boot) -> dict | None:
+        """写接口需要登录态 authcookie；getLoginInfo 为空时从 cookie 里
+        兜底取 P00001。返回 {'authcookie', 'uid'} 或 None（无法写）。"""
+        auth = str(boot.get("authcookie") or "")
+        uid = str(boot.get("uid") or "")
+        if not auth:
+            try:
+                for c in await page.context.cookies():
+                    if c.get("name") == "P00001" and c.get("value"):
+                        auth = c["value"]
+                        break
+                    if c.get("name") == "P00003" and c.get("value") and not uid:
+                        uid = c["value"]
+            except Exception:
+                pass
+        if not auth:
+            return None
+        return {"authcookie": auth, "uid": uid}
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """页内 JSONP publish.action 发评（business_type=17，getSign 签名）。
+
+        爱奇艺前台/创作者中心均无置顶评论入口（踩点确认），pinned=True 时
+        仍发布普通评论并在 message 中说明。
+        """
+        work_id = str(work_id or "").strip()
+        if not work_id or not (content or "").strip():
+            return {"ok": False, "message": "参数缺失（work_id / content）"}
+        browser = None
+        try:
+            browser, context, page, boot = await self._comment_page(cookie_file)
+            if boot.get("error"):
+                return {"ok": False, "message": str(boot["error"])}
+            auth = await self._ensure_comment_auth(page, boot)
+            if not auth:
+                msg = "无评论登录态（authcookie 缺失，前台 SSO 未生效）"
+                logger.info("[iqiyi post_comment] %s 失败: %s", work_id, msg)
+                return {"ok": False, "message": msg}
+
+            result = await page.evaluate(
+                """async ([tvId, text, authcookie]) => {
+                    const snsGet = window.__qfsync_boot.snsGet;
+                    const r = await snsGet('publish.action', {
+                        reply_id: '', content_id: tvId, text: text,
+                        authcookie: authcookie, device_id: '', appid: 'iqiyi_web',
+                        business_type: '17', agenttype: '118',
+                        agentversion: '9.11.5',
+                    });
+                    if (!r) return {ok: false, message: '接口无响应'};
+                    if (r.__err) return {ok: false, message: '请求失败: ' + r.__err};
+                    if (r.code !== 'A00000') {
+                        return {ok: false, message: (r.msg || r.code)
+                            + (r.data && typeof r.data === 'string'
+                               ? ' ' + r.data : '')};
+                    }
+                    const d = r.data || {};
+                    return {ok: true,
+                            comment_id: String(d.reply_id || d.replyId
+                                || d.id || d.comment_id || '')};
+                }""",
+                [work_id, content.strip(), auth["authcookie"]],
+            )
+            if not isinstance(result, dict) or not result.get("ok"):
+                msg = (result or {}).get("message", "未知错误") \
+                    if isinstance(result, dict) else str(result)
+                logger.info("[iqiyi post_comment] %s 失败: %s", work_id, msg)
+                return {"ok": False, "message": msg}
+            note = "" if not pinned else "爱奇艺平台不支持置顶评论，已发布为普通评论"
+            logger.info(
+                "[iqiyi post_comment] %s 发布成功 id=%s pinned=%s",
+                work_id, result.get("comment_id"), False,
+            )
+            return {
+                "ok": True,
+                "comment_id": result.get("comment_id") or "",
+                "pinned": False,
+                "message": note,
+            }
+        except Exception as e:
+            logger.info("[iqiyi post_comment] 发布失败: %s", e)
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """页内 JSONP delete_comment.action 删评（reply_id=评论ID）。"""
+        work_id = str(work_id or "").strip()
+        cid = str(comment_id or "").strip()
+        if not work_id or not cid:
+            return {"ok": False, "message": "参数缺失（work_id / comment_id）"}
+        browser = None
+        try:
+            browser, context, page, boot = await self._comment_page(cookie_file)
+            if boot.get("error"):
+                return {"ok": False, "message": str(boot["error"])}
+            auth = await self._ensure_comment_auth(page, boot)
+            if not auth:
+                msg = "无评论登录态（authcookie 缺失，前台 SSO 未生效）"
+                logger.info(
+                    "[iqiyi delete_comment] %s %s 失败: %s", work_id, cid, msg
+                )
+                return {"ok": False, "message": msg}
+
+            result = await page.evaluate(
+                """async ([cid, authcookie]) => {
+                    const snsGet = window.__qfsync_boot.snsGet;
+                    const r = await snsGet('delete_comment.action', {
+                        reply_id: cid, authcookie: authcookie,
+                        appid: 'iqiyi_web', business_type: '17',
+                    });
+                    if (!r) return {ok: false, message: '接口无响应'};
+                    if (r.__err) return {ok: false, message: '请求失败: ' + r.__err};
+                    if (r.code !== 'A00000') return {ok: false, message: r.msg || r.code};
+                    return {ok: true};
+                }""",
+                [cid, auth["authcookie"]],
+            )
+            if not isinstance(result, dict) or not result.get("ok"):
+                msg = (result or {}).get("message", "未知错误") \
+                    if isinstance(result, dict) else str(result)
+                logger.info(
+                    "[iqiyi delete_comment] %s %s 失败: %s", work_id, cid, msg
+                )
+                return {"ok": False, "message": msg}
+            logger.info("[iqiyi delete_comment] %s %s 删除成功", work_id, cid)
+            return {"ok": True, "message": ""}
+        except Exception as e:
+            logger.info("[iqiyi delete_comment] 删除失败: %s", e)
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """页内 JSONP publish.action 回复评论（reply_id=目标评论）。
+
+        爱奇艺评论区为两级结构（评论 + 楼中楼），不区分 root/parent，
+        回复一律挂到目标评论（parent_id，为空则用 root_id）下。
+        """
+        work_id = str(work_id or "").strip()
+        root_id = str(root_id or "").strip()
+        parent_id = str(parent_id or "").strip()
+        target_id = parent_id or root_id
+        if not work_id or not target_id or not (content or "").strip():
+            return {"ok": False,
+                    "message": "参数缺失（work_id / root_id / parent_id / content）"}
+        browser = None
+        try:
+            browser, context, page, boot = await self._comment_page(cookie_file)
+            if boot.get("error"):
+                return {"ok": False, "message": str(boot["error"])}
+            auth = await self._ensure_comment_auth(page, boot)
+            if not auth:
+                msg = "无评论登录态（authcookie 缺失，前台 SSO 未生效）"
+                logger.info("[iqiyi reply_comment] %s 失败: %s", work_id, msg)
+                return {"ok": False, "message": msg}
+
+            result = await page.evaluate(
+                """async ([tvId, replyId, text, authcookie]) => {
+                    const snsGet = window.__qfsync_boot.snsGet;
+                    const r = await snsGet('publish.action', {
+                        reply_id: replyId, content_id: tvId, text: text,
+                        authcookie: authcookie, device_id: '', appid: 'iqiyi_web',
+                        business_type: '17', agenttype: '118',
+                        agentversion: '9.11.5',
+                    });
+                    if (!r) return {ok: false, message: '接口无响应'};
+                    if (r.__err) return {ok: false, message: '请求失败: ' + r.__err};
+                    if (r.code !== 'A00000') {
+                        return {ok: false, message: (r.msg || r.code)
+                            + (r.data && typeof r.data === 'string'
+                               ? ' ' + r.data : '')};
+                    }
+                    const d = r.data || {};
+                    return {ok: true,
+                            comment_id: String(d.reply_id || d.replyId
+                                || d.id || d.comment_id || '')};
+                }""",
+                [work_id, target_id, content.strip(), auth["authcookie"]],
+            )
+            if not isinstance(result, dict) or not result.get("ok"):
+                msg = (result or {}).get("message", "未知错误") \
+                    if isinstance(result, dict) else str(result)
+                logger.info(
+                    "[iqiyi reply_comment] %s 回复 %s 失败: %s",
+                    work_id, target_id, msg,
+                )
+                return {"ok": False, "message": msg}
+            logger.info(
+                "[iqiyi reply_comment] %s 回复成功 id=%s target=%s",
+                work_id, result.get("comment_id"), target_id,
+            )
+            return {
+                "ok": True,
+                "comment_id": result.get("comment_id") or "",
+                "message": "",
+            }
+        except Exception as e:
+            logger.info("[iqiyi reply_comment] 回复失败: %s", e)
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
