@@ -845,6 +845,23 @@ def delete_work_comment(detail_id, comment_id):
     return jsonify({"code": 200, "data": {"task_id": start_delete_comment(detail_id, comment_id)}})
 
 
+@ext_api.route('/works/<detail_id>/comments/<comment_id>/reply', methods=['POST'])
+def reply_work_comment(detail_id, comment_id):
+    """回复一条评论（浏览器自动化，异步执行）。
+
+    Body: {"content": str}
+    Response 200: {"code": 200, "data": {"task_id": str}}
+    Response 400: content 为空
+    """
+    from services.comments import start_reply_comment
+    data = request.get_json(silent=True) or {}
+    content = (data.get('content') or '').strip()
+    if not content:
+        return jsonify({"code": 400, "msg": "回复内容不能为空"}), 400
+    task_id = start_reply_comment(detail_id, comment_id, content)
+    return jsonify({"code": 200, "data": {"task_id": task_id}})
+
+
 @ext_api.route('/works/comments/tasks/<task_id>', methods=['GET'])
 def get_comment_task(task_id):
     """评论任务状态轮询：{status: running|done|error, result, error}。"""

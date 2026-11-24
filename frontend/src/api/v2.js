@@ -93,6 +93,10 @@ export const commentsApi = {
   remove(detailId, commentId) {
     return http.delete(`/api/v2/works/${detailId}/comments/${commentId}`)
   },
+  // 回复一条评论（浏览器自动化，异步）: { content } → { task_id }
+  reply(detailId, commentId, content) {
+    return http.post(`/api/v2/works/${detailId}/comments/${commentId}/reply`, { content })
+  },
 }
 
 // 统计数据

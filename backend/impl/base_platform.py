@@ -486,3 +486,19 @@ class BasePlatform(ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support deleting comments"
         )
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """回复一条评论（楼中楼/二级评论）。
+
+        Args:
+            root_id:   所属顶级评论 ID（目标本身是顶级时与 parent_id 相同）
+            parent_id: 要回复的目标评论 ID
+        返回 {"ok": bool, "comment_id": str(新回复的ID), "message": str}。
+        失败 → {"ok": False, "message": 原因}（不抛异常）。
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support replying to comments"
+        )

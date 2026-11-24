@@ -476,6 +476,95 @@ def _run_delete(task_id: str, detail_id: str, comment_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 回复评论（单条）
+# ---------------------------------------------------------------------------
+
+def start_reply_comment(detail_id: str, comment_id: str, content: str) -> str:
+    """启动后台回复任务（浏览器自动化），返回 task_id。"""
+    task_id = str(uuid.uuid4())
+    with _tasks_lock:
+        _tasks[task_id] = {
+            "status": "running", "kind": "reply", "detail_id": detail_id,
+            "comment_id": comment_id,
+            "result": None, "error": "", "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    threading.Thread(
+        target=_run_reply, args=(task_id, detail_id, comment_id, content),
+        daemon=True, name=f"comment-reply-{task_id[:8]}",
+    ).start()
+    return task_id
+
+
+def _run_reply(task_id: str, detail_id: str, comment_id: str, content: str) -> None:
+    detail = _load_detail(detail_id)
+    if not detail:
+        _finish_error(task_id, "发布明细不存在")
+        return
+    platform_id = detail.get("platform_id")
+    cookie_file = (detail.get("cookie_file") or "").strip()
+    if not platform_id or not cookie_file:
+        _finish_error(task_id, "账号不存在或 cookie 配置缺失")
+        return
+    work_id = _resolve_work_id(detail)
+    if not work_id:
+        _finish_error(task_id, "未找到作品 ID（请先执行「重新关联」回填作品链接）")
+        return
+
+    # 目标评论的 parent_id 决定 root：目标是顶级评论 → root=parent=目标；
+    # 目标是楼中楼 → root=其所属顶级评论, parent=目标
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT parent_id FROM work_comments WHERE detail_id = ? AND comment_id = ?",
+            (detail_id, comment_id),
+        ).fetchone()
+    finally:
+        conn.close()
+    if row is None:
+        _finish_error(task_id, "目标评论不存在（请先同步评论）")
+        return
+    root_id = (row["parent_id"] or "").strip() or comment_id
+
+    ok, result = _call_platform(
+        platform_id, cookie_file, "reply_comment",
+        work_id=work_id, root_id=root_id, parent_id=comment_id, content=content,
+    )
+    if not ok:
+        _finish_error(task_id, result.get("message") or "该平台暂未支持回复评论")
+        return
+    if not result.get("ok"):
+        with _tasks_lock:
+            _tasks[task_id].update(status="error", error=result.get("message") or "回复失败")
+        return
+
+    # 自己的回复落库（挂到顶级评论下作为楼中楼）
+    detail["work_id"] = work_id
+    try:
+        _upsert_comment_row(detail, {
+            "comment_id": result.get("comment_id") or f"local-{task_id[:8]}",
+            "parent_id": root_id,
+            "author": detail.get("account_name") or "",
+            "avatar": "", "content": content,
+            "like_count": 0, "reply_count": 0,
+            "publish_time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "location": "", "is_author": True, "pinned": False,
+        })
+    except Exception as exc:
+        logger.warning("[Comments] 回复落库失败(不影响结果): %s", exc)
+
+    with _tasks_lock:
+        _tasks[task_id].update(status="done", result={
+            "ok": True,
+            "comment_id": result.get("comment_id") or "",
+            "message": "回复已发布",
+        })
+    logger.info(
+        "[Comments] 回复完成 detail=%s root=%s parent=%s", detail_id, root_id, comment_id,
+    )
+
+
+# ---------------------------------------------------------------------------
 # 查询
 # ---------------------------------------------------------------------------
 

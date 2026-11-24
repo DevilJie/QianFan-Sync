@@ -2582,3 +2582,67 @@ class BilibiliPlatform(BasePlatform):
                     await browser.close()
                 except Exception:
                     pass
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """页内 fetch 回复评论（/x/v2/reply/add，root=顶级 rpid，parent=目标 rpid）。"""
+        bvid = (work_id or "").strip()
+        root_id = str(root_id or "").strip()
+        parent_id = str(parent_id or "").strip()
+        if not bvid or not root_id or not parent_id or not (content or "").strip():
+            return {"ok": False, "message": "参数缺失（work_id / root_id / parent_id / content）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            result = await page.evaluate(
+                """
+                async ([bvid, rootId, parentId, message]) => {
+                    const viewResp = await fetch(
+                        'https://api.bilibili.com/x/web-interface/view?bvid=' + bvid,
+                        { credentials: 'include' });
+                    const view = await viewResp.json();
+                    if (view.code !== 0) return { ok: false, message: '取稿件信息失败: ' + view.message };
+                    const aid = view.data.aid;
+                    const csrf = (document.cookie.match(/bili_jct=([^;]+)/) || [])[1] || '';
+                    if (!csrf) return { ok: false, message: 'cookie 中无 bili_jct（csrf）' };
+
+                    const body = new URLSearchParams({
+                        oid: String(aid), type: '1',
+                        root: rootId, parent: parentId, message: message,
+                        plat: '1', csrf: csrf, csrf_token: csrf,
+                    });
+                    const addResp = await fetch('https://api.bilibili.com/x/v2/reply/add', {
+                        method: 'POST', credentials: 'include',
+                        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                        body: body.toString(),
+                    });
+                    const add = await addResp.json();
+                    if (add.code !== 0) return { ok: false, message: '回复失败: ' + (add.message || add.code) };
+                    return { ok: true, comment_id: String(add.data?.rpid || ''), message: '' };
+                }
+                """,
+                [bvid, root_id, parent_id, content.strip()],
+            )
+            if not isinstance(result, dict) or not result.get("ok"):
+                msg = (result or {}).get("message", "未知错误") if isinstance(result, dict) else str(result)
+                logger.info(f"[bilibili reply_comment] {bvid} 回复失败: {msg}")
+                return {"ok": False, "message": msg}
+            logger.info(
+                f"[bilibili reply_comment] {bvid} 回复成功 rpid={result.get('comment_id')} root={root_id}"
+            )
+            return {
+                "ok": True,
+                "comment_id": result.get("comment_id") or "",
+                "message": result.get("message") or "",
+            }
+        except Exception as e:
+            logger.info(f"[bilibili reply_comment] 回复失败: {e}")
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass

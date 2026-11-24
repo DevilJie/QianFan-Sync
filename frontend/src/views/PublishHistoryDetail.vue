@@ -151,7 +151,7 @@
             </section>
 
             <!-- 评论区（数据来自后端评论同步 work_comments 表） -->
-            <section class="comments-card">
+            <section v-loading="commentDeleting" class="comments-card" element-loading-text="正在删除评论…">
               <header class="comments-header">
                 <h3 class="section-title">
                   评论
@@ -188,7 +188,11 @@
                     <p class="comment-content">{{ c.content }}</p>
                     <div class="comment-ops">
                       <span class="op"><el-icon><CaretTop /></el-icon>{{ c.like_count }}</span>
-                      <span class="op"><el-icon><ChatDotRound /></el-icon>回复</span>
+                      <span
+                        v-if="commentCaps.supports_comment"
+                        class="op"
+                        @click="openReplyDialog(c)"
+                      >回复</span>
                       <span
                         v-if="commentCaps.supports_delete_comment"
                         class="op op-delete"
@@ -206,7 +210,14 @@
                             <span v-if="r.isAuthor" class="author-chip">UP主</span>
                           </div>
                           <p class="reply-content">{{ r.content }}</p>
-                          <div class="reply-meta">{{ r.time }} · {{ r.location }} · 赞 {{ r.like_count }}</div>
+                          <div class="reply-meta">
+                              {{ r.time }}<template v-if="r.location"> · {{ r.location }}</template> · 赞 {{ r.like_count }}
+                              <span
+                                v-if="commentCaps.supports_comment"
+                                class="reply-reply"
+                                @click="openReplyDialog(r)"
+                              >回复</span>
+                            </div>
                         </div>
                       </div>
                       <button v-if="repliesToggleLabel(c)" class="replies-toggle" @click="toggleReplies(c)">
@@ -217,8 +228,8 @@
                 </div>
               </div>
 
-              <!-- 一键评论弹窗：输入内容 → 浏览器自动化发评（可选置顶） -->
-              <el-dialog v-model="commentDialogVisible" title="发布评论" width="480px" :close-on-click-modal="false" append-to-body>
+              <!-- 评论弹窗：发布模式(批次全账号) / 回复模式(单条目标) -->
+              <el-dialog v-model="commentDialogVisible" :title="commentDialogTitle" width="480px" :close-on-click-modal="false" append-to-body>
                 <div class="comment-dialog-body">
                   <el-input
                     v-model="commentContent"
@@ -226,19 +237,21 @@
                     :rows="4"
                     maxlength="500"
                     show-word-limit
-                    placeholder="输入要发布的评论内容（将以该账号身份发布到作品评论区）"
+                    :placeholder="commentDialogTitle === '发布评论'
+                      ? '输入要发布的评论内容（将以批次内各账号身份发布到各自作品评论区）'
+                      : `回复 @${replyTarget?.author || ''}：`"
                   />
-                  <el-checkbox v-if="commentCaps.supports_pin_comment" v-model="commentPinned" class="comment-pin-check">
+                  <el-checkbox v-if="!replyTarget && commentCaps.supports_pin_comment" v-model="commentPinned" class="comment-pin-check">
                     发布后置顶该评论
                   </el-checkbox>
-                  <div v-if="!commentCaps.supports_comment" class="comment-unsupported">
-                    当前平台暂未支持评论功能（首期支持 B站）
+                  <div v-if="!replyTarget && !commentCaps.supports_comment" class="comment-unsupported">
+                    部分平台暂未支持评论功能（首期支持 B站），对应账号将自动跳过
                   </div>
                 </div>
                 <template #footer>
                   <el-button @click="commentDialogVisible = false">取消</el-button>
                   <el-button type="primary" :loading="commentPosting" :disabled="!commentContent.trim()" @click="submitComment">
-                    {{ commentPosting ? '发布中…' : '发送' }}
+                    {{ commentPosting ? (replyTarget ? '回复中…' : `发布中 ${commentProgressText}`) : (replyTarget ? '回复' : '发送') }}
                   </el-button>
                 </template>
               </el-dialog>
@@ -596,28 +609,76 @@ async function syncComments() {
   }
 }
 
-// ===== 一键评论：弹窗输入 → 浏览器自动化发评（可选置顶）=====
+// ===== 一键评论 / 回复：弹窗输入 → 浏览器自动化执行 =====
 const commentDialogVisible = ref(false)
 const commentContent = ref('')
 const commentPinned = ref(false)
 const commentPosting = ref(false)
 // 弹窗能力跟随当前明细平台（置顶选项仅支持平台显示）
 const commentCaps = computed(() => commentsCaps.value)
+// 回复模式：非空 = 回复该条评论（单账号单条），空 = 批次发布模式
+const replyTarget = ref(null)
+const commentDialogTitle = computed(() =>
+  replyTarget.value ? `回复 @${replyTarget.value.author || ''}` : '发布评论'
+)
 
 function openCommentDialog() {
   if (!batch.value) return
   if (!commentsCaps.value.supports_comment) {
     ElMessage.info('当前选中平台暂未支持评论功能（首期支持 B站），不支持的账号将自动跳过')
   }
+  replyTarget.value = null
+  commentContent.value = ''
+  commentPinned.value = false
+  commentDialogVisible.value = true
+}
+
+// 回复模式：目标可以是顶级评论，也可以是楼中楼某条回复
+function openReplyDialog(c) {
+  if (!selectedItem.value) return
+  if (!commentsCaps.value.supports_comment) {
+    ElMessage.info('当前平台暂未支持评论功能（首期支持 B站）')
+    return
+  }
+  replyTarget.value = c
   commentContent.value = ''
   commentPinned.value = false
   commentDialogVisible.value = true
 }
 
 async function submitComment() {
-  const batchId = batch.value?.id
+  const detailId = selectedItem.value?.id
   const content = commentContent.value.trim()
-  if (!batchId || !content || commentPosting.value) return
+  if (!content || commentPosting.value) return
+
+  // 回复模式：单条回复当前选中账号作品下的目标评论
+  if (replyTarget.value) {
+    if (!detailId) return
+    commentPosting.value = true
+    try {
+      const res = await commentsApi.reply(detailId, replyTarget.value.id, content)
+      const taskId = res?.data?.task_id
+      if (!taskId) throw new Error('未返回任务 ID')
+      pollCommentTask(taskId, 1, (err) => {
+        commentPosting.value = false
+        if (err) {
+          ElMessage.error('回复失败: ' + err)
+          return
+        }
+        commentDialogVisible.value = false
+        replyTarget.value = null
+        ElMessage.success('回复已发布')
+      })
+    } catch (e) {
+      commentPosting.value = false
+      ElMessage.error('触发回复失败: ' + (e?.message || e))
+    }
+    return
+  }
+
+  // 批次发布模式：批次内全部成功明细逐个发评
+  const batchId = batch.value?.id
+  if (!batchId) return
   commentPosting.value = true
   commentProgressText.value = ''
   const total = batch.value.items.filter(it => it.status === 'success').length
@@ -1456,6 +1517,15 @@ onMounted(async () => {
   padding: 0;
   font-family: inherit;
   font-size: 12px;
+  color: $brand-start;
+  cursor: pointer;
+
+  &:hover { text-decoration: underline; }
+}
+
+// 楼中楼「回复」入口
+.reply-reply {
+  margin-left: 8px;
   color: $brand-start;
   cursor: pointer;
 
