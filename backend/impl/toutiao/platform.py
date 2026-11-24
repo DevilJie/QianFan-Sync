@@ -4170,3 +4170,373 @@ class ToutiaoPlatform(BasePlatform):
             return []
         finally:
             await self.close_browser(browser, is_close_by_code=True)
+
+    # ------------------------------------------------------------------
+    # 作品评论 — 后台「评论管理」agw 路线(2026-11 实机踩点实证)
+    # ------------------------------------------------------------------
+    # 宿主页: mp.toutiao.com/profile_v4/manage/comment/all(后台 cookie 即可,
+    # 前台 www.toutiao.com 实测未共享登录态, 无 sid_tt);
+    # 端点(页内 fetch 直调, 无签名):
+    #   GET  /comment/author_receive_comment/  全部作品收到的评论(含置顶标记)
+    #   GET  /mp/agw/comment/article_comment_list 单作品评论列表(含作者自评)
+    #   GET  /mp/agw/comment/dongtai_list      楼中楼(按顶级 comment_id)
+    #   POST /mp/agw/comment/add               作者发新顶级评论 → data.comment_id
+    #   POST /mp/agw/comment/action            回复(type=1) → data.dongtai_id
+    #   POST /mp/agw/comment/stick|unstick     置顶/取消置顶(每作品限 1 条)
+    #   POST /mp/agw/comment/hide              删除(顶级与楼中楼通用, 实测)
+
+    supports_comment = True
+    supports_pin_comment = True
+    supports_delete_comment = True
+
+    _COMMENT_MANAGE_URL = (
+        "https://mp.toutiao.com/profile_v4/manage/comment/all"
+    )
+    # 页内 fetch 通用 form POST 助手(失败返回 {code: -1, message: ...})
+    _POST_FORM_JS = """
+        async ([path, body]) => {
+            try {
+                const resp = await fetch(path + '?app_id=1231', {
+                    method: 'POST',
+                    credentials: 'include',
+                    headers: {
+                        'Content-Type': 'application/x-www-form-urlencoded',
+                    },
+                    body: new URLSearchParams(body).toString(),
+                });
+                return await resp.json();
+            } catch (e) {
+                return {code: -1, message: String(e)};
+            }
+        }
+    """
+
+    async def _comment_page(self, cookie_file: str):
+        """打开后台评论管理页(登录态宿主), 返回 (browser, context, page)。
+        调用方负责关闭。cookie 失效抛 RuntimeError(由各方法转失败返回)。"""
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        context = await self.create_context(browser, storage_state=cookie_path)
+        page = await context.new_page()
+        try:
+            await page.goto(
+                self._COMMENT_MANAGE_URL,
+                wait_until="domcontentloaded",
+                timeout=30000,
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+        if "mp.toutiao.com" not in (page.url or ""):
+            raise RuntimeError("cookie 失效(跳转 %s)" % page.url)
+        return browser, context, page
+
+    @staticmethod
+    def _fmt_comment_time(ts):
+        """unix 秒 → 展示文本(空值安全)。"""
+        try:
+            ts = int(str(ts).strip())
+        except (ValueError, TypeError):
+            return ""
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """抓取作品评论区: 单作品评论列表 + 楼中楼展开。
+
+        顶级评论来自 /mp/agw/comment/article_comment_list(item_id+group_id
+        直取本作品, 含作者自评, 按 cursor 翻页); 楼中楼来自
+        /mp/agw/comment/dongtai_list(reply_count>0 时展开)。
+        cookie 失效 / 抓取失败 → 返回 []（不抛异常）。
+        """
+        gid = (work_id or "").strip()
+        if not gid:
+            return []
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            raw = await page.evaluate(
+                """async ([gid, limit]) => {
+                    const get = async (path) => {
+                        const r = await fetch(path + '&_=' + Date.now(),
+                            {credentials: 'include'});
+                        return await r.json();
+                    };
+                    // 作者 user_id(用于 is_author 判定), 拿不到为空
+                    let selfId = '';
+                    try {
+                        const u = await get('/mp/agw/creator_center/user_info'
+                            + '?app_id=1231');
+                        selfId = String(u.user_id_str || u.user_id
+                            || (u.data || {}).user_id || '');
+                    } catch (e) {}
+                    const tops = [];
+                    let offset = 0;
+                    for (let i = 0; i < 10; i++) {
+                        const j = await get('/mp/agw/comment/'
+                            + 'article_comment_list?item_id=' + gid
+                            + '&group_id=' + gid + '&offset=' + offset
+                            + '&count=20&app_id=1231');
+                        if (!j || j.code !== 0) return {error: (j && j.message)
+                            || ('code ' + (j && j.code))};
+                        const d = j.data || {};
+                        const list = d.data || [];
+                        for (const c of list) tops.push(c);
+                        if (!d.has_more || !list.length
+                            || tops.length >= limit) break;
+                        offset = Number(d.cursor || (offset + 20));
+                    }
+                    // 楼中楼展开(顶级 reply_count>0 时逐条拉取)
+                    const dongtais = {};
+                    for (const c of tops) {
+                        const rc = Number(c.reply_count
+                            || c.comment_count || 0);
+                        if (rc <= 0) continue;
+                        const cid = String(c.comment_id || '');
+                        try {
+                            const j = await get('/mp/agw/comment/dongtai_list'
+                                + '?count=' + Math.max(rc, 20) + '&offset=0'
+                                + '&comment_id=' + cid + '&app_id=1231');
+                            if (j && j.code === 0) {
+                                dongtais[cid] = ((j.data || {}).data) || [];
+                            }
+                        } catch (e) {}
+                    }
+                    return {tops: tops, dongtais: dongtais, selfId: selfId};
+                }""",
+                [gid, max(int(limit or 100), 1)],
+            )
+            if not isinstance(raw, dict) or raw.get("error"):
+                logger.info(
+                    "[头条评论列表] 接口返回异常: %s",
+                    raw.get("error") if isinstance(raw, dict) else raw,
+                )
+                return []
+            self_id = str(raw.get("selfId") or "")
+            dongtais = raw.get("dongtais") or {}
+
+            comments: list[dict] = []
+            for c in raw.get("tops") or []:
+                cid = str(c.get("comment_id") or "")
+                user = c.get("user") or {}
+                comments.append({
+                    "comment_id": cid,
+                    "parent_id": "",
+                    "author": str(user.get("screen_name")
+                                  or user.get("name") or ""),
+                    "avatar": str(user.get("avatar_url") or ""),
+                    "content": str(c.get("content") or ""),
+                    "like_count": int(c.get("digg_count") or 0),
+                    "reply_count": int(c.get("reply_count")
+                                       or c.get("comment_count") or 0),
+                    "publish_time": self._fmt_comment_time(c.get("create_time")),
+                    "location": "",
+                    "is_author": bool(self_id) \
+                        and str(user.get("user_id")) == self_id,
+                    "pinned": bool(c.get("is_stick") or c.get("has_stick")),
+                })
+                for d in dongtais.get(cid) or []:
+                    duser = d.get("user") or {}
+                    comments.append({
+                        "comment_id": str(d.get("id") or ""),
+                        "parent_id": cid,
+                        "author": str(duser.get("name") or ""),
+                        "avatar": str(duser.get("avatar_url") or ""),
+                        "content": str(d.get("content") or ""),
+                        "like_count": int(d.get("digg_count") or 0),
+                        "reply_count": 0,
+                        "publish_time": self._fmt_comment_time(
+                            d.get("create_time")
+                        ),
+                        "location": "",
+                        "is_author": bool(self_id) \
+                            and str(duser.get("id_str")
+                                    or duser.get("user_id")) == self_id,
+                        "pinned": False,
+                    })
+            logger.info("[头条评论列表] %s 抓到 %d 条评论", gid, len(comments))
+            return comments
+        except Exception as exc:
+            logger.info("[头条评论列表] list_comments 失败: %s", exc)
+            return []
+        finally:
+            if browser is not None:
+                try:
+                    await self.close_browser(browser, is_close_by_code=True)
+                except Exception:
+                    pass
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """后台 agw 发新顶级评论(/mp/agw/comment/add), 按需置顶(stick)。
+
+        置顶接口对新评论可能有索引延迟, 间隔重试(最多 5 次 x 2s)。
+        失败 → {"ok": False, "message": 原因}（不抛异常）。
+        """
+        gid = (work_id or "").strip()
+        if not gid or not (content or "").strip():
+            return {"ok": False, "message": "参数缺失（work_id / content）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            result = await page.evaluate(
+                self._POST_FORM_JS,
+                [
+                    "/mp/agw/comment/add",
+                    {"content": content.strip(), "group_id": gid, "item_id": gid},
+                ],
+            )
+            if not isinstance(result, dict) or result.get("code") != 0:
+                msg = (result or {}).get("message", "未知错误") \
+                    if isinstance(result, dict) else str(result)
+                logger.info("[头条发评论] %s 失败: %s", gid, msg)
+                return {"ok": False, "message": f"发评失败: {msg}"}
+            # 实测 comment_id 在响应顶层(data 外)
+            comment_id = str(
+                result.get("comment_id")
+                or (result.get("data") or {}).get("comment_id")
+                or ""
+            )
+
+            if pinned and comment_id:
+                # 新评论置顶可能有延迟, 重试兜底
+                pinned_ok = False
+                last_err = ""
+                for i in range(5):
+                    await asyncio.sleep(0.5 if i == 0 else 2)
+                    top = await page.evaluate(
+                        self._POST_FORM_JS,
+                        [
+                            "/mp/agw/comment/stick",
+                            {"group_id": gid, "comment_id": comment_id,
+                             "item_id": gid},
+                        ],
+                    )
+                    if isinstance(top, dict) and top.get("code") == 0:
+                        pinned_ok = True
+                        break
+                    last_err = (top or {}).get("message", "") \
+                        if isinstance(top, dict) else str(top)
+                if not pinned_ok:
+                    return {
+                        "ok": True, "comment_id": comment_id, "pinned": False,
+                        "message": f"评论已发布，但置顶失败: {last_err}",
+                    }
+                return {
+                    "ok": True, "comment_id": comment_id,
+                    "pinned": True, "message": "",
+                }
+            return {
+                "ok": True, "comment_id": comment_id,
+                "pinned": False, "message": "",
+            }
+        except Exception as exc:
+            logger.info("[头条发评论] post_comment 失败: %s", exc)
+            return {"ok": False, "message": str(exc)}
+        finally:
+            if browser is not None:
+                try:
+                    await self.close_browser(browser, is_close_by_code=True)
+                except Exception:
+                    pass
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """后台 agw 回复评论(/mp/agw/comment/action, type=1)。
+
+        root_id=顶级评论 ID, parent_id=目标评论 ID(顶级时两者相同;
+        楼中楼时传对应 dongtai ID)。失败 → {"ok": False, ...}（不抛异常）。
+        """
+        gid = (work_id or "").strip()
+        root_id = str(root_id or "").strip()
+        parent_id = str(parent_id or "").strip()
+        if not gid or not root_id or not parent_id or not (content or "").strip():
+            return {
+                "ok": False,
+                "message": "参数缺失（work_id / root_id / parent_id / content）",
+            }
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            result = await page.evaluate(
+                self._POST_FORM_JS,
+                [
+                    "/mp/agw/comment/action",
+                    {
+                        "type": "1",
+                        "content": content.strip(),
+                        "comment_id": root_id,
+                        "item_id": gid,
+                        "group_id": gid,
+                        "reply_comment_id": parent_id,
+                    },
+                ],
+            )
+            if not isinstance(result, dict) or result.get("code") != 0:
+                msg = (result or {}).get("message", "未知错误") \
+                    if isinstance(result, dict) else str(result)
+                logger.info(
+                    "[头条回复评论] %s root=%s parent=%s 失败: %s",
+                    gid, root_id, parent_id, msg,
+                )
+                return {"ok": False, "message": f"回复失败: {msg}"}
+            reply_id = str((result.get("data") or {}).get("dongtai_id") or "")
+            logger.info(
+                "[头条回复评论] %s root=%s parent=%s 成功 reply=%s",
+                gid, root_id, parent_id, reply_id,
+            )
+            return {"ok": True, "comment_id": reply_id, "message": ""}
+        except Exception as exc:
+            logger.info("[头条回复评论] reply_comment 失败: %s", exc)
+            return {"ok": False, "message": str(exc)}
+        finally:
+            if browser is not None:
+                try:
+                    await self.close_browser(browser, is_close_by_code=True)
+                except Exception:
+                    pass
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """后台 agw 删除评论(/mp/agw/comment/hide)。
+
+        实测对顶级评论与楼中楼回复通用(传对应 comment_id)。
+        失败 → {"ok": False, ...}（不抛异常）。
+        """
+        gid = (work_id or "").strip()
+        cid = str(comment_id or "").strip()
+        if not gid or not cid:
+            return {"ok": False, "message": "参数缺失（work_id / comment_id）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            result = await page.evaluate(
+                self._POST_FORM_JS,
+                [
+                    "/mp/agw/comment/hide",
+                    {"comment_id": cid, "item_id": gid, "group_id": gid},
+                ],
+            )
+            if not isinstance(result, dict) or result.get("code") != 0:
+                msg = (result or {}).get("message", "未知错误") \
+                    if isinstance(result, dict) else str(result)
+                logger.info(
+                    "[头条删除评论] %s comment=%s 失败: %s", gid, cid, msg
+                )
+                return {"ok": False, "message": f"删除失败: {msg}"}
+            logger.info("[头条删除评论] %s comment=%s 删除成功", gid, cid)
+            return {"ok": True, "message": ""}
+        except Exception as exc:
+            logger.info("[头条删除评论] delete_comment 失败: %s", exc)
+            return {"ok": False, "message": str(exc)}
+        finally:
+            if browser is not None:
+                try:
+                    await self.close_browser(browser, is_close_by_code=True)
+                except Exception:
+                    pass

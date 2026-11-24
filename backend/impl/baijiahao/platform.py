@@ -3459,3 +3459,406 @@ class BaijiahaoPlatform(BasePlatform):
             return int(str(v).strip())
         except (ValueError, TypeError):
             return None
+
+    # ------------------------------------------------------------------
+    # 作品评论（评论管理 / 评论同步）
+    # ------------------------------------------------------------------
+
+    supports_comment = True
+    supports_pin_comment = True
+    supports_delete_comment = True
+
+    # 前台评论区 ext.baidu.com 评论组件 appid(百家号图文/视频落地页固定值,
+    # 2026-11-24 实机踩点 scratch/probe_bjh_comment*.py)
+    _COMMENT_APPID = "22862035"
+
+    async def _comment_page(self, cookie_file: str, work_id: str):
+        """打开作品前台页(s?id, 与后台共享 .baidu.com 登录态), 解析评论
+        thread_id(前台组件 thread_id ≠ article_id, 来自页面内
+        window.jsonData.bsData.comment.tid)。
+
+        返回 (browser, context, page, thread_id)。调用方负责三层关闭。
+        cookie 失效(跳登录 marker)抛 RuntimeError。
+        """
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        work_id = str(work_id or "").strip()
+        if not work_id:
+            raise RuntimeError("work_id 为空")
+        browser = await self.create_browser(headless=True)
+        try:
+            context = await self.create_context(browser, storage_state=cookie_path)
+            try:
+                page = await context.new_page()
+                url = f"https://baijiahao.baidu.com/s?id={work_id}"
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await page.wait_for_load_state("load", timeout=15000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+                # 登录态校验(跳到任一失效 marker 即失效)
+                current_url = page.url or ""
+                for marker in self._COOKIE_INVALID_URL_MARKERS:
+                    if marker in current_url:
+                        raise RuntimeError(
+                            f"cookie 失效(跳转 {marker})")
+
+                # 解析 thread_id(视频落地页可能跳 mbd.baidu.com, 同样尝试解析)
+                tid = ""
+                try:
+                    tid = str(await page.evaluate(
+                        "() => (window.jsonData && window.jsonData.bsData"
+                        " && window.jsonData.bsData.comment"
+                        " && window.jsonData.bsData.comment.tid) || ''"))
+                except Exception:
+                    tid = ""
+                if not tid:
+                    tid = await page.evaluate(
+                        """() => {
+                            const m = (document.documentElement.innerHTML)
+                                .match(/"tid"\\s*:\\s*"(\\d+)"/);
+                            return m ? m[1] : '';
+                        }""")
+                if not tid:
+                    raise RuntimeError(
+                        f"未能从作品页解析评论 thread_id(页面: {current_url[:120]})")
+                return browser, context, page, tid
+            except Exception:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                raise
+        except Exception:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+            raise
+
+    @staticmethod
+    def _jsonp_fetch_js() -> str:
+        """页内 JSONP GET(与前台评论组件同款调用), 返回 JSON 对象。
+
+        ext.baidu.com 接口为 JSONP 形态, POST(addreply)可用 fetch 直调,
+        GET(list/delreply)走动态 script 注入的 JSONP(实机踩点验证)。
+        """
+        return """
+            async (url) => {
+                const cb = 'qfJsonp' + Math.random().toString(36).slice(2);
+                return await new Promise((resolve, reject) => {
+                    const timer = setTimeout(
+                        () => reject(new Error('jsonp timeout')), 15000);
+                    window[cb] = (data) => {
+                        clearTimeout(timer);
+                        try { delete window[cb]; } catch (e) { window[cb] = undefined; }
+                        resolve(data);
+                    };
+                    const s = document.createElement('script');
+                    s.src = url + (url.includes('?') ? '&' : '?') + 'callback=' + cb;
+                    s.onerror = () => {
+                        clearTimeout(timer);
+                        reject(new Error('jsonp script error'));
+                    };
+                    document.head.appendChild(s);
+                });
+            }
+        """
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """抓作品前台评论(ext.baidu.com /api/comment/v2/comment/list, JSONP)。
+
+        thread_id 从作品页 window.jsonData 解析; 一级评论经 ret.list[],
+        楼中楼在条目 reply_list[]。任何失败(参数缺失/cookie 失效/接口异常)
+        log 后返回 [], 绝不抛异常。
+        """
+        work_id = str(work_id or "").strip()
+        if not work_id:
+            logger.info("[baijiahao list_comments] work_id 为空")
+            return []
+        browser = None
+        try:
+            browser, context, page, tid = await self._comment_page(
+                cookie_file, work_id)
+
+            # 翻页拉取(start/num), 每页 20 条
+            fetch_js = """
+                async ([tid, appid, num, maxCount]) => {
+                    const jsonp = (url) => new Promise((resolve, reject) => {
+                        const cb = 'qfJsonp' + Math.random().toString(36).slice(2);
+                        const timer = setTimeout(() => reject(new Error('timeout')), 15000);
+                        window[cb] = (d) => { clearTimeout(timer); resolve(d); };
+                        const s = document.createElement('script');
+                        s.src = url + '&callback=' + cb;
+                        s.onerror = () => { clearTimeout(timer); reject(new Error('script err')); };
+                        document.head.appendChild(s);
+                    });
+                    const out = [];
+                    let start = 0;
+                    for (let i = 0; i < 50 && out.length < maxCount; i++) {
+                        const url = 'https://ext.baidu.com/api/comment/v2/comment/list'
+                            + '?thread_id=' + tid + '&reply_id=&start=' + start
+                            + '&num=' + num + '&appid=' + appid
+                            + '&order=12&inner_order=9&use_list=1&source=feed'
+                            + '&out_reply_id=&use_uk=1';
+                        const j = await jsonp(url);
+                        if (!j || String(j.errno) !== '0') {
+                            return { code: 1, message: 'errno=' + (j ? j.errno : 'null'),
+                                     items: out };
+                        }
+                        const ret = j.ret || {};
+                        for (const it of (ret.list || [])) {
+                            out.push(it);
+                            // 楼中楼扁平挂到父条目 _children
+                            const kids = it.reply_list || [];
+                            it._children = kids;
+                        }
+                        start += num;
+                        if (ret.is_over === true || ret.is_over === 'true') break;
+                        if (!(ret.list || []).length) break;
+                    }
+                    return { code: 0, items: out,
+                             comment_count: 0 };
+                }
+            """
+            result = await page.evaluate(fetch_js, [tid, self._COMMENT_APPID, 20, int(limit)])
+            if not isinstance(result, dict) or result.get("code") != 0:
+                logger.info(
+                    f"[baijiahao list_comments] {work_id} 拉取失败: {result}")
+                return []
+
+            def _fmt(ts) -> str:
+                if not ts:
+                    return ""
+                from datetime import datetime, timezone, timedelta
+                try:
+                    return datetime.fromtimestamp(
+                        int(str(ts)), tz=timezone(timedelta(hours=8))
+                    ).strftime("%Y-%m-%d %H:%M")
+                except (ValueError, TypeError, OSError):
+                    return ""
+
+            comments: list[dict] = []
+
+            def _row(item: dict, parent_id: str) -> dict:
+                return {
+                    "comment_id": str(item.get("reply_id") or ""),
+                    "parent_id": parent_id,
+                    "author": str(item.get("uname") or ""),
+                    "avatar": str(item.get("avatar") or ""),
+                    "content": str(item.get("content") or ""),
+                    "like_count": int(item.get("like_count") or 0),
+                    "reply_count": int(item.get("reply_count") or 0),
+                    "publish_time": _fmt(item.get("create_time")),
+                    "location": str(item.get("area") or ""),
+                    "is_author": bool(item.get("is_author")),
+                    "pinned": False,
+                }
+
+            for it in result.get("items") or []:
+                parent_row = _row(it, "")
+                comments.append(parent_row)
+                for kid in it.get("_children") or []:
+                    comments.append(_row(kid, parent_row["comment_id"]))
+
+            logger.info(
+                f"[baijiahao list_comments] {work_id} thread={tid} "
+                f"抓到 {len(comments)} 条(含楼中楼)"
+            )
+            return comments[: int(limit)]
+        except Exception as exc:
+            logger.info(f"[baijiahao list_comments] 抓取失败: {exc}")
+            return []
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """页内 fetch POST ext.baidu.com/api/comment/v1/comment/addreply 发评。
+
+        实机踩点: 置顶无已确证端点(候选 top/settop 均 errno 101, 前台/
+        后台均无置顶入口), 故 pinned=True 时评论正常发布但 pinned=False,
+        错误说明放 message, 不阻塞 ok=True(契约要求)。
+        """
+        work_id = str(work_id or "").strip()
+        content = (content or "").strip()
+        if not work_id or not content:
+            return {"ok": False, "message": "参数缺失（work_id / content）"}
+        browser = None
+        try:
+            browser, context, page, tid = await self._comment_page(
+                cookie_file, work_id)
+            result = await page.evaluate(
+                """
+                async ([tid, appid, content]) => {
+                    const body = new URLSearchParams({
+                        appid: String(appid), thread_id: tid, content: content,
+                        sync_text: '0', ts: String(Date.now()), client_type: 'pc',
+                    });
+                    const resp = await fetch(
+                        'https://ext.baidu.com/api/comment/v1/comment/addreply',
+                        { method: 'POST', credentials: 'include',
+                          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                          body: body.toString() });
+                    let j;
+                    try { j = await resp.json(); }
+                    catch (e) { return { ok: false, message: '响应解析失败: ' + e }; }
+                    if (String(j.errno) !== '0') {
+                        return { ok: false, message: '发评失败: errno=' + j.errno
+                            + (j.errmsg ? ' ' + j.errmsg : '') };
+                    }
+                    return { ok: true, comment_id: String((j.ret || {}).reply_id || '') };
+                }
+                """,
+                [tid, self._COMMENT_APPID, content],
+            )
+            if not isinstance(result, dict) or not result.get("ok"):
+                msg = (result or {}).get("message", "未知错误") if isinstance(result, dict) else str(result)
+                logger.info(f"[baijiahao post_comment] {work_id} 失败: {msg}")
+                return {"ok": False, "message": msg}
+            comment_id = str(result.get("comment_id") or "")
+            logger.info(
+                f"[baijiahao post_comment] {work_id} 发布成功 reply_id={comment_id}"
+            )
+            if pinned:
+                # 置顶端点未确证(见方法 docstring): 不阻塞发布结果
+                return {
+                    "ok": True,
+                    "comment_id": comment_id,
+                    "pinned": False,
+                    "message": "评论已发布，但置顶未执行：百家号置顶接口未能确证",
+                }
+            return {"ok": True, "comment_id": comment_id, "pinned": False, "message": ""}
+        except Exception as exc:
+            logger.info(f"[baijiahao post_comment] 发布失败: {exc}")
+            return {"ok": False, "message": str(exc)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """页内 JSONP GET ext.baidu.com/api/comment/v1/comment/delreply 删评。
+
+        作者本人可删自己作品评论区下的任意评论(含楼中楼, 传对应 reply_id),
+        2026-11-24 实机踩点: 顶级与楼中楼回复均删除成功(errno=0)。
+        """
+        work_id = str(work_id or "").strip()
+        comment_id = str(comment_id or "").strip()
+        if not work_id or not comment_id:
+            return {"ok": False, "message": "参数缺失（work_id / comment_id）"}
+        browser = None
+        try:
+            browser, context, page, tid = await self._comment_page(
+                cookie_file, work_id)
+            url = (
+                "https://ext.baidu.com/api/comment/v1/comment/delreply"
+                f"?appid={self._COMMENT_APPID}&thread_id={tid}"
+                f"&reply_id={comment_id}&user_type=0&ts={int(time.time() * 1000)}"
+            )
+            result = await page.evaluate(self._jsonp_fetch_js(), url)
+            if not isinstance(result, dict) or str(result.get("errno")) != "0":
+                msg = (
+                    f"删除失败: errno={result.get('errno')}"
+                    f"{' ' + str(result.get('errmsg')) if result.get('errmsg') else ''}"
+                    if isinstance(result, dict) else str(result)
+                )
+                logger.info(
+                    f"[baijiahao delete_comment] {work_id} reply={comment_id} 失败: {msg}"
+                )
+                return {"ok": False, "message": msg}
+            logger.info(
+                f"[baijiahao delete_comment] {work_id} reply={comment_id} 删除成功"
+            )
+            return {"ok": True, "message": ""}
+        except Exception as exc:
+            logger.info(f"[baijiahao delete_comment] 删除失败: {exc}")
+            return {"ok": False, "message": str(exc)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """页内 fetch POST addreply 回复评论(parent_id=目标评论 reply_id)。
+
+        实机踩点: 该评论体系为两级(顶级 + 楼中楼), addreply 只带
+        parent_id; 回复顶级时 parent_id=顶级评论 id, 楼中楼内回复时
+        parent_id=目标楼中楼 id(root_id 不参与请求, 仅作参数完整性校验)。
+        """
+        work_id = str(work_id or "").strip()
+        root_id = str(root_id or "").strip()
+        parent_id = str(parent_id or "").strip()
+        content = (content or "").strip()
+        if not work_id or not parent_id or not content:
+            return {"ok": False,
+                    "message": "参数缺失（work_id / parent_id / content）"}
+        browser = None
+        try:
+            browser, context, page, tid = await self._comment_page(
+                cookie_file, work_id)
+            result = await page.evaluate(
+                """
+                async ([tid, appid, parentId, content]) => {
+                    const body = new URLSearchParams({
+                        appid: String(appid), thread_id: tid,
+                        parent_id: parentId, content: content,
+                        sync_text: '0', ts: String(Date.now()), client_type: 'pc',
+                    });
+                    const resp = await fetch(
+                        'https://ext.baidu.com/api/comment/v1/comment/addreply',
+                        { method: 'POST', credentials: 'include',
+                          headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                          body: body.toString() });
+                    let j;
+                    try { j = await resp.json(); }
+                    catch (e) { return { ok: false, message: '响应解析失败: ' + e }; }
+                    if (String(j.errno) !== '0') {
+                        return { ok: false, message: '回复失败: errno=' + j.errno
+                            + (j.errmsg ? ' ' + j.errmsg : '') };
+                    }
+                    return { ok: true, comment_id: String((j.ret || {}).reply_id || '') };
+                }
+                """,
+                [tid, self._COMMENT_APPID, parent_id, content],
+            )
+            if not isinstance(result, dict) or not result.get("ok"):
+                msg = (result or {}).get("message", "未知错误") if isinstance(result, dict) else str(result)
+                logger.info(f"[baijiahao reply_comment] {work_id} 回复失败: {msg}")
+                return {"ok": False, "message": msg}
+            comment_id = str(result.get("comment_id") or "")
+            logger.info(
+                f"[baijiahao reply_comment] {work_id} 回复成功 reply_id={comment_id} "
+                f"parent={parent_id}"
+            )
+            return {"ok": True, "comment_id": comment_id, "message": ""}
+        except Exception as exc:
+            logger.info(f"[baijiahao reply_comment] 回复失败: {exc}")
+            return {"ok": False, "message": str(exc)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass

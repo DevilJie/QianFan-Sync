@@ -2133,3 +2133,539 @@ class DouyinPlatform(BasePlatform):
             return []
         finally:
             await self.close_browser(browser, is_close_by_code=True)
+
+    # ------------------------------------------------------------------
+    # 作品评论（一键评论 / 评论同步）
+    #
+    # 踩点结论（2026-11-24, 实机 cookie 验证）：
+    # 1. creator 后台评论管理路由 /creator-micro/content/comment-manage
+    #    会 302 到 content/upload，抓包无任何 janus 评论接口族 → 后台路线不存在。
+    # 2. 前台 /aweme/v1/web/comment/list/ 在作品详情页的页面上下文内
+    #    直接 fetch 免签名（仅需登录 cookie），实测拉全量评论 OK → list 走 API。
+    # 3. 前台 comment/publish 直 fetch 返回 status_code 2053（缺 msToken+a_bogus）；
+    #    页面自身的发布请求带 msToken+a_bogus 签名，但签名由页面内部网络层生成，
+    #    无法外部复用（复制完整 URL 直 fetch 返回空响应体=风控拦截）→ 写操作走 DOM。
+    # 4. DOM 发评实测会触发「接收短信验证码」人工风控（181*****07 手机号），
+    #    接口 200 但评论并不落地 → post/reply/delete 检测验证弹窗并诚实报错。
+    # 5. 置顶能力：PC 前台/后台均未见置顶入口（创作者后台评论管理页不存在），
+    #    且置顶仅限自己作品下自己的评论 → supports_pin_comment = False（诚实标注）。
+    # ------------------------------------------------------------------
+
+    supports_comment = True
+    # 抖音置顶仅限自己作品下自己的评论且有审核；PC 端未提供置顶入口（踩点未验证通过）
+    supports_pin_comment = False
+    supports_delete_comment = True
+
+    _FRONT_HOME_URL = "https://www.douyin.com/"
+
+    async def _comment_page(self, cookie_file: str):
+        """打开前台登录态浏览器。返回 (browser, context, page)。
+
+        cookie 全部 .douyin.com 域，后台 storage_state 前台通用；先 goto 首页
+        让 ttwid/msToken 等运行时 cookie 刷新，再进详情页（否则可能被判游客）。
+        """
+        cookie_path = str(Path(BASE_DIR / "cookiesFile" / cookie_file))
+        browser = await self.create_browser(headless=True)
+        context = await self.create_context(browser, storage_state=cookie_path)
+        page = await context.new_page()
+        await page.set_viewport_size({"width": 1920, "height": 1080})
+        try:
+            await page.goto(self._FRONT_HOME_URL, wait_until="domcontentloaded", timeout=40000)
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+        return browser, context, page
+
+    async def _goto_work(self, page, work_id: str) -> None:
+        """进作品详情页并关掉「是否保存登录信息」等弹窗。"""
+        try:
+            await page.goto(
+                f"https://www.douyin.com/video/{work_id}",
+                wait_until="domcontentloaded", timeout=40000,
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(6)
+        # 登录信息保存弹窗（按钮内含 spinner 图标，textContent 用 includes 匹配）
+        for _ in range(3):
+            hit = await page.evaluate(
+                """() => {
+                    for (const b of document.querySelectorAll('button')) {
+                        const t = (b.textContent || '').trim();
+                        if (t.includes('取消') && t.length < 8) { b.click(); return t; }
+                    }
+                    return null;
+                }"""
+            )
+            if not hit:
+                break
+            await asyncio.sleep(0.8)
+
+    async def _own_sec_uid(self, page) -> str:
+        """从详情页作者链接取作品作者的 sec_uid，用于 is_author 判定。"""
+        try:
+            return await page.evaluate(
+                """() => {
+                    const a = document.querySelector('a[href*="MS4wLjABAAA"]');
+                    const m = a ? (a.getAttribute('href')||'')
+                        .match(/MS4wLjABAAA[\\w-]+/) : null;
+                    return m ? m[0] : '';
+                }"""
+            )
+        except Exception:
+            return ""
+
+    @staticmethod
+    async def _fetch_comment_tree(page, aweme_id: str, limit: int) -> dict:
+        """页内 fetch 拉评论树（免签名）。顶层翻页 + 楼中楼 reply 子列表。"""
+        return await page.evaluate(
+            """async ([aid, limit]) => {
+                const listPath = '/aweme/v1/web/comment/list/';
+                const replyPath = '/aweme/v1/web/comment/list/reply/';
+                const common = 'device_platform=webapp&aid=6383&version_code=170400';
+                const tops = [];
+                let cursor = 0;
+                for (let i = 0; i < 10 && tops.length < limit; i++) {
+                    const resp = await fetch(listPath + '?aweme_id=' + aid
+                        + '&cursor=' + cursor + '&count=20&' + common,
+                        {credentials: 'include'});
+                    const j = await resp.json().catch(() => null);
+                    if (!j || j.status_code !== 0) return {code: j ? j.status_code : -1};
+                    for (const c of (j.comments || [])) {
+                        const node = {
+                            cid: String(c.cid || ''), parent: '',
+                            user: (c.user && c.user.nickname) || '',
+                            avatar: (c.user && c.user.avatar_thumb
+                                && c.user.avatar_thumb.url_list
+                                && c.user.avatar_thumb.url_list[0]) || '',
+                            sec: (c.user && c.user.sec_uid) || '',
+                            text: c.text || '', digg: c.digg_count || 0,
+                            ts: c.create_time || 0,
+                            ip: c.ip_label || '',
+                            stick: !!c.stick_position,
+                        };
+                        // 楼中楼（先取接口内嵌 reply_list，不够再拉 reply 子接口）
+                        const mapReply = r => ({
+                            cid: String(r.cid || ''), parent: node.cid,
+                            user: (r.user && r.user.nickname) || '',
+                            avatar: (r.user && r.user.avatar_thumb
+                                && r.user.avatar_thumb.url_list
+                                && r.user.avatar_thumb.url_list[0]) || '',
+                            sec: (r.user && r.user.sec_uid) || '',
+                            text: r.text || '', digg: r.digg_count || 0,
+                            ts: r.create_time || 0, ip: r.ip_label || '',
+                            stick: false,
+                        });
+                        node.children = (c.reply_list || []).map(mapReply);
+                        if (!node.children.length && c.reply_comment_total > 0) {
+                            try {
+                                const r2 = await fetch(replyPath + '?comment_id=' + node.cid
+                                    + '&aweme_id=' + aid + '&cursor=0&count=20&' + common,
+                                    {credentials: 'include'});
+                                const j2 = await r2.json().catch(() => null);
+                                if (j2 && j2.status_code === 0) {
+                                    node.children = (j2.comments || []).map(mapReply);
+                                }
+                            } catch (e) { /* 楼中楼失败不阻断主列表 */ }
+                        }
+                        tops.push(node);
+                        if (tops.length >= limit) break;
+                    }
+                    if (!j.has_more) break;
+                    cursor = j.cursor || 0;
+                    if (!cursor) break;
+                }
+                return {code: 0, comments: tops};
+            }""",
+            [aweme_id, max(int(limit or 100), 1)],
+        )
+
+    async def list_comments(
+        self, cookie_file: str, work_id: str, limit: int = 100
+    ) -> list[dict]:
+        """抓取作品评论区（含楼中楼）。
+
+        路线：前台作品详情页页内 fetch /aweme/v1/web/comment/list/（踩点实测
+        免签名，仅需登录 cookie），楼中楼走 reply 子接口。cookie 失效或风控
+        拦截（空响应体）→ 返回 []，不抛异常。
+        """
+        aweme_id = str(work_id or "").strip()
+        if not aweme_id:
+            return []
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            await self._goto_work(page, aweme_id)
+            if "/video/" not in (page.url or "") and "/note/" not in (page.url or ""):
+                logger.info("[抖音评论列表] 详情页未打开(跳转 %s)", page.url)
+                return []
+
+            own_sec = await self._own_sec_uid(page)
+            result = await self._fetch_comment_tree(page, aweme_id, limit)
+            if not isinstance(result, dict) or result.get("code") != 0:
+                logger.info("[抖音评论列表] 接口返回异常: %s", result)
+                return []
+
+            def _fmt(ts):
+                if not ts:
+                    return ""
+                try:
+                    return time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts)))
+                except Exception:
+                    return ""
+
+            comments: list[dict] = []
+
+            def _push(n, parent_id):
+                comments.append({
+                    "comment_id": n["cid"],
+                    "parent_id": parent_id,
+                    "author": n.get("user") or "",
+                    "avatar": n.get("avatar") or "",
+                    "content": n.get("text") or "",
+                    "like_count": int(n.get("digg") or 0),
+                    "reply_count": len(n.get("children") or []),
+                    "publish_time": _fmt(n.get("ts")),
+                    "location": n.get("ip") or "",
+                    "is_author": bool(own_sec) and n.get("sec") == own_sec,
+                    "pinned": bool(n.get("stick")),
+                })
+                for c in n.get("children") or []:
+                    _push(c, n["cid"])
+
+            for n in result.get("comments") or []:
+                _push(n, "")
+            logger.info(
+                "[抖音评论列表] %s 抓到 %d 条(含楼中楼, own_sec=%s)",
+                aweme_id, len(comments), bool(own_sec),
+            )
+            return comments[:limit]
+        except Exception as e:
+            logger.info("[抖音评论列表] 抓取失败: %s", e)
+            return []
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    @staticmethod
+    async def _detect_verify_dialog(page) -> bool:
+        """检测发评/删评触发的人工风控弹窗（短信验证码 / 滑块验证）。"""
+        try:
+            return await page.evaluate(
+                """() => {
+                    const t = document.body ? document.body.innerText : '';
+                    return /接收短信验证码|请输入验证码|拖动滑块|安全验证/.test(t);
+                }"""
+            )
+        except Exception:
+            return False
+
+    async def post_comment(
+        self, cookie_file: str, work_id: str, content: str, pinned: bool = False
+    ) -> dict:
+        """以前台登录态在作品详情页 DOM 发一条顶级评论。
+
+        踩点实证：自动化发评会触发「接收短信验证码」人工风控（接口 200 但
+        评论不落地）→ 检测到验证弹窗即返回失败并如实提示；未触发风控时
+        （可信环境）以评论区出现新评论为准。置顶不支持（见
+        supports_pin_comment 注释），pinned=True 仅忽略。
+        """
+        aweme_id = str(work_id or "").strip()
+        text = (content or "").strip()
+        if not aweme_id or not text:
+            return {"ok": False, "comment_id": "", "pinned": False,
+                    "message": "参数缺失（work_id / content）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            await self._goto_work(page, aweme_id)
+            focused = await page.evaluate(
+                """() => {
+                    const els = [...document.querySelectorAll(
+                        'div,input,textarea,section,p,span')];
+                    const ph = els.find(e => [...e.childNodes].some(n =>
+                        n.nodeType === 3
+                        && /留下你|友善的评论|说说你的想法/.test(n.textContent || '')));
+                    if (ph) { ph.click(); return true; }
+                    const box = document.getElementById('comment-input-container');
+                    if (box) {
+                        const ed = box.querySelector(
+                            '[contenteditable="true"], textarea, input') || box;
+                        ed.click();
+                        return true;
+                    }
+                    return false;
+                }"""
+            )
+            if not focused:
+                msg = "未找到评论输入框（详情页结构可能已变更）"
+                logger.info("[抖音发评] %s 失败: %s", aweme_id, msg)
+                return {"ok": False, "comment_id": "", "pinned": False, "message": msg}
+            await asyncio.sleep(1)
+            # contenteditable 富文本逐字符输入，触发 React onChange
+            editor = page.locator(
+                '[id="comment-input-container"] [contenteditable="true"]').first
+            if await editor.count() == 0:
+                editor = page.locator('[contenteditable="true"]').first
+            typed = False
+            if await editor.count() > 0:
+                try:
+                    await editor.press_sequentially(text, delay=100)
+                    typed = True
+                except Exception:
+                    pass
+            if not typed:
+                await page.keyboard.type(text, delay=100)
+            await asyncio.sleep(2)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(5)
+
+            if await self._detect_verify_dialog(page):
+                msg = ("触发平台人工验证（短信验证码/安全验证），评论未发布；"
+                       "请在有头可信环境重试")
+                logger.info("[抖音发评] %s 触发人工风控", aweme_id)
+                return {"ok": False, "comment_id": "", "pinned": False, "message": msg}
+
+            # 轮询确认落地（接口 200 ≠ 展示；审核中会查不到 → 如实标注）
+            cid = ""
+            for _ in range(5):
+                cid = await page.evaluate(
+                    """async ([aid, text]) => {
+                        const resp = await fetch('/aweme/v1/web/comment/list/?aweme_id='
+                            + aid + '&cursor=0&count=50&device_platform=webapp'
+                            + '&aid=6383&version_code=170400',
+                            {credentials: 'include'});
+                        const j = await resp.json().catch(() => null);
+                        const hit = ((j && j.comments) || [])
+                            .find(c => (c.text || '') === text);
+                        return hit ? String(hit.cid) : '';
+                    }""",
+                    [aweme_id, text],
+                )
+                if cid:
+                    break
+                await asyncio.sleep(3)
+
+            if cid:
+                logger.info("[抖音发评] %s 发布成功 cid=%s", aweme_id, cid)
+                return {"ok": True, "comment_id": cid, "pinned": False, "message": ""}
+            msg = "接口已响应但评论区未查到新评论（可能审核中或被风控拦截）"
+            logger.info("[抖音发评] %s: %s", aweme_id, msg)
+            return {"ok": False, "comment_id": "", "pinned": False, "message": msg}
+        except Exception as e:
+            logger.info("[抖音发评] 发布失败: %s", e)
+            return {"ok": False, "comment_id": "", "pinned": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def reply_comment(
+        self, cookie_file: str, work_id: str,
+        root_id: str, parent_id: str, content: str,
+    ) -> dict:
+        """回复一条评论（楼中楼），走详情页 DOM。
+
+        DOM 由页面自身构造 publish 请求：回复顶级评论时页面自带
+        reply_comment_id=线程根 id；回复楼中楼时 reply_to_reply_id=被回复的
+        二级评论 id —— 与契约 root_id/parent_id 语义一致，无需手工映射。
+        定位目标评论：先经 list 接口取其文本，再在评论区 DOM 中按文本匹配
+        （DOM 不暴露 cid，此为最小可靠锚点；目标楼未渲染时如实报受限）。
+        """
+        aweme_id = str(work_id or "").strip()
+        root_id = str(root_id or "").strip()
+        parent_id = str(parent_id or "").strip()
+        text = (content or "").strip()
+        if not aweme_id or not root_id or not parent_id or not text:
+            return {"ok": False, "comment_id": "",
+                    "message": "参数缺失（work_id / root_id / parent_id / content）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            await self._goto_work(page, aweme_id)
+
+            # 经 list 接口取目标评论文本作为 DOM 锚点
+            tree = await self._fetch_comment_tree(page, aweme_id, 100)
+            anchor_text = ""
+            if isinstance(tree, dict) and tree.get("code") == 0:
+                for n in tree.get("comments") or []:
+                    for node in [n] + (n.get("children") or []):
+                        if node.get("cid") == parent_id:
+                            anchor_text = (node.get("text") or "").strip()
+                            break
+                    if anchor_text:
+                        break
+            if not anchor_text:
+                msg = "目标评论不在前 100 条内，DOM 无法定位（受限）"
+                logger.info("[抖音回复] %s: %s", aweme_id, msg)
+                return {"ok": False, "comment_id": "", "message": msg}
+
+            clicked = await page.evaluate(
+                """(anchor) => {
+                    const items = [...document.querySelectorAll(
+                        '[data-e2e="comment-item"]')];
+                    const target = items.find(it =>
+                        (it.textContent || '').includes(anchor));
+                    if (!target) return 'not-in-dom';
+                    const r = [...target.querySelectorAll('span,div,p')]
+                        .find(e => (e.textContent || '').trim() === '回复'
+                            && e.children.length === 0);
+                    if (!r) return 'no-reply-btn';
+                    r.click();
+                    return 'clicked';
+                }""",
+                anchor_text[:30],
+            )
+            if clicked != "clicked":
+                msg = f"目标评论 DOM 不可达（{clicked}，评论区未渲染该楼）"
+                logger.info("[抖音回复] %s: %s", aweme_id, msg)
+                return {"ok": False, "comment_id": "", "message": msg}
+            await asyncio.sleep(2)
+            await page.keyboard.type(text, delay=100)
+            await asyncio.sleep(2)
+            await page.keyboard.press("Enter")
+            await asyncio.sleep(5)
+
+            if await self._detect_verify_dialog(page):
+                msg = "触发平台人工验证（短信验证码/安全验证），回复未发布"
+                logger.info("[抖音回复] %s 触发人工风控", aweme_id)
+                return {"ok": False, "comment_id": "", "message": msg}
+
+            # 确认：楼中楼列表出现新文本
+            for _ in range(4):
+                found = await page.evaluate(
+                    """async ([aid, rootId, text]) => {
+                        const resp = await fetch('/aweme/v1/web/comment/list/reply/'
+                            + '?comment_id=' + rootId + '&aweme_id=' + aid
+                            + '&cursor=0&count=50&device_platform=webapp&aid=6383'
+                            + '&version_code=170400', {credentials: 'include'});
+                        const j = await resp.json().catch(() => null);
+                        const hit = ((j && j.comments) || [])
+                            .find(c => (c.text || '') === text);
+                        return hit ? String(hit.cid) : '';
+                    }""",
+                    [aweme_id, root_id, text],
+                )
+                if found:
+                    logger.info(
+                        "[抖音回复] %s 回复成功 cid=%s root=%s",
+                        aweme_id, found, root_id,
+                    )
+                    return {"ok": True, "comment_id": found, "message": ""}
+                await asyncio.sleep(3)
+            msg = "回复已提交但楼中楼未查到新评论（可能审核中或被风控拦截）"
+            logger.info("[抖音回复] %s: %s", aweme_id, msg)
+            return {"ok": False, "comment_id": "", "message": msg}
+        except Exception as e:
+            logger.info("[抖音回复] 回复失败: %s", e)
+            return {"ok": False, "comment_id": "", "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+
+    async def delete_comment(
+        self, cookie_file: str, work_id: str, comment_id: str
+    ) -> dict:
+        """删除评论区下的一条评论（UP 主可删他人评论，本人可删自己评论）。
+
+        DOM 不暴露 cid → 先经 list 接口取目标文本，再在评论区 DOM 中按文本
+        匹配，hover 出操作菜单点「删除」并确认，删除后经 list 接口复查。
+        """
+        aweme_id = str(work_id or "").strip()
+        cid = str(comment_id or "").strip()
+        if not aweme_id or not cid:
+            return {"ok": False, "message": "参数缺失（work_id / comment_id）"}
+        browser = None
+        try:
+            browser, context, page = await self._comment_page(cookie_file)
+            await self._goto_work(page, aweme_id)
+
+            tree = await self._fetch_comment_tree(page, aweme_id, 100)
+            anchor_text = ""
+            if isinstance(tree, dict) and tree.get("code") == 0:
+                for n in tree.get("comments") or []:
+                    for node in [n] + (n.get("children") or []):
+                        if node.get("cid") == cid:
+                            anchor_text = (node.get("text") or "").strip()
+                            break
+                    if anchor_text:
+                        break
+            if not anchor_text:
+                msg = "目标评论不在前 100 条内，DOM 无法定位（受限）"
+                logger.info("[抖音删评] %s cid=%s: %s", aweme_id, cid, msg)
+                return {"ok": False, "message": msg}
+
+            outcome = await page.evaluate(
+                """async (anchor) => {
+                    const items = [...document.querySelectorAll(
+                        '[data-e2e="comment-item"]')];
+                    const target = items.find(it =>
+                        (it.textContent || '').includes(anchor));
+                    if (!target) return 'not-in-dom';
+                    const more = target.querySelector(
+                        '[data-e2e="video-comment-more"]');
+                    if (!more) return 'no-more-btn';
+                    more.dispatchEvent(new MouseEvent('mouseover',
+                        {bubbles: true}));
+                    more.click();
+                    await new Promise(r => setTimeout(r, 1200));
+                    const del = [...document.querySelectorAll('span,div,li')]
+                        .find(e => (e.textContent || '').trim() === '删除'
+                            && e.offsetParent !== null && e.children.length === 0);
+                    if (!del) return 'menu-no-delete';
+                    del.click();
+                    await new Promise(r => setTimeout(r, 1200));
+                    const confirm = [...document.querySelectorAll('button')]
+                        .find(b => ['确定', '删除', '确认'].some(x =>
+                            (b.textContent || '').trim() === x));
+                    if (confirm) { confirm.click(); return 'confirmed'; }
+                    return 'clicked-no-dialog';
+                }""",
+                anchor_text[:30],
+            )
+            if outcome.startswith(("not-in-dom", "no-more", "menu-no")):
+                msg = f"删除失败（DOM: {outcome}）"
+                logger.info("[抖音删评] %s cid=%s: %s", aweme_id, cid, outcome)
+                return {"ok": False, "message": msg}
+            await asyncio.sleep(3)
+
+            if await self._detect_verify_dialog(page):
+                msg = "触发平台人工验证（短信验证码/安全验证），删除未执行"
+                logger.info("[抖音删评] %s 触发人工风控", aweme_id)
+                return {"ok": False, "message": msg}
+
+            gone = await page.evaluate(
+                """async ([aid, cid]) => {
+                    const resp = await fetch('/aweme/v1/web/comment/list/?aweme_id='
+                        + aid + '&cursor=0&count=50&device_platform=webapp'
+                        + '&aid=6383&version_code=170400',
+                        {credentials: 'include'});
+                    const j = await resp.json().catch(() => null);
+                    return !((j && j.comments) || [])
+                        .find(c => String(c.cid) === cid);
+                }""",
+                [aweme_id, cid],
+            )
+            if gone:
+                logger.info("[抖音删评] %s cid=%s 删除成功", aweme_id, cid)
+                return {"ok": True, "message": ""}
+            msg = "点击删除后评论仍在评论区（可能未生效或需审核）"
+            logger.info("[抖音删评] %s cid=%s: %s", aweme_id, cid, msg)
+            return {"ok": False, "message": msg}
+        except Exception as e:
+            logger.info("[抖音删评] 删除失败: %s", e)
+            return {"ok": False, "message": str(e)}
+        finally:
+            if browser is not None:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
