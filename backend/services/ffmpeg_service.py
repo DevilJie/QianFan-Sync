@@ -123,7 +123,10 @@ def get_video_duration(video_path: str) -> float:
         video_path,
     ]
     logger.debug("Running ffprobe: {}", " ".join(cmd))
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    result = subprocess.run(
+        cmd, capture_output=True, text=True, check=True,
+        encoding="utf-8", errors="replace",
+    )
     duration = float(result.stdout.strip())
     return duration
 
@@ -147,7 +150,10 @@ def get_video_dimensions(video_path: str) -> tuple[int, int]:
     ]
     logger.debug("Running ffprobe for dimensions: {}", " ".join(cmd))
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True,
+            encoding="utf-8", errors="replace",
+        )
         output = result.stdout.strip()
         if output:
             parts = output.split(",")
@@ -225,7 +231,10 @@ def _extract_frames_sync(base_dir, video_path: str) -> None:
             output_pattern,
         ]
         logger.info("Extracting frames: {}", " ".join(cmd))
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        subprocess.run(
+            cmd, capture_output=True, text=True, check=True,
+            encoding="utf-8", errors="replace",
+        )
 
         frame_files = sorted(
             output_dir.glob("frame_*.jpg"),
@@ -381,7 +390,10 @@ def get_frame_image_path(
     ]
     logger.info("Extracting HD frame: {}", " ".join(cmd))
     try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
+        subprocess.run(
+            cmd, capture_output=True, text=True, check=True,
+            encoding="utf-8", errors="replace",
+        )
         return str(hd_path)
     except subprocess.CalledProcessError as exc:
         logger.error("Failed to extract HD frame at {}s: {}", seconds, exc)
@@ -430,6 +442,7 @@ def get_video_duration_safe(video_path: str) -> float:
         result = subprocess.run(
             [FFMPEG, "-i", video_path],
             capture_output=True, text=True, timeout=10,
+            encoding="utf-8", errors="replace",
             stdin=subprocess.DEVNULL,
         )
         return _parse_duration_from_stderr(result.stderr)
@@ -479,6 +492,7 @@ def get_video_dimensions_safe(video_path: str) -> tuple[int, int]:
         result = subprocess.run(
             [FFMPEG, "-i", video_path],
             capture_output=True, text=True, timeout=10,
+            encoding="utf-8", errors="replace",
             stdin=subprocess.DEVNULL,
         )
         return _parse_dimensions_from_stderr(result.stderr)
