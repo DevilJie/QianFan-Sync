@@ -265,26 +265,25 @@ def test_worker_task_done_called_once_on_success():
     assert t.status == TaskStatus.SUCCESS
 
 
-def test_worker_task_done_called_once_after_retry():
-    """失败重试路径：第一次 task_done() 在 retry 路径，第二次（永久失败）在 finally。共 2 次，无 ValueError。"""
+def test_worker_task_done_called_once_on_fail():
+    """失败路径（重试已禁用，47cebec）：失败立即 FAILED，task_done() 恰好 1 次。"""
     worker = _make_test_queue()
     t = PublishTask(platform='douyin', platform_type=3, account_name='a1')
     t.max_retries = 1
-    # 用 fail-retry：第一次失败触发 retry（re-queue），第二次再失败（max_retries 耗尽）
     calls = _run_worker_through_tasks(worker, [(t, 'fail-retry')])
-    # 两次循环（一次 retry 重入队，一次最终失败）应该恰好 2 次 task_done
-    assert len(calls) == 2, f"expected 2 task_done calls (retry + permanent), got {len(calls)}: {calls}"
+    # 重试已禁用：失败不重入队，一次循环即结束，恰好 1 次 task_done
+    assert len(calls) == 1, f"expected 1 task_done call (no-retry), got {len(calls)}: {calls}"
     assert t.status == TaskStatus.FAILED
+    assert t.retry_count == 0
 
 
 def test_worker_no_double_task_done():
-    """回归测试：连续重试后 worker 不应触发 'task_done() called too many times'。
+    """回归测试：失败后 worker 恰好一次 task_done()，不会触发
+    'task_done() called too many times'（ValueError）。
 
-    在 asyncio.Queue 中，重复 task_done() 会抛 ValueError。这里通过一个
-    使用真实 asyncio.Queue 的版本验证：worker 跑完后 unfinished_tasks 应等于 0
-    （每次 get 都有对应 task_done），并且 worker 不抛 ValueError。
-
-    通过在 task_done 上 wrap 计数 + 主动关闭 queue 模拟 sentinel 退出。
+    重试已禁用（47cebec）：max_retries=1 的任务失败即终态，execute
+    只跑 1 次；真实 asyncio.Queue 的 unfinished_tasks 应归零
+    （get 与 task_done 严格配对）。
     """
     q = TaskQueue(max_concurrent=1)
     real_queue = asyncio.Queue()
@@ -326,12 +325,10 @@ def test_worker_no_double_task_done():
                 pass
         asyncio.run(main())
 
-    # worker 处理了 2 次（一次 retry 一次 permanent fail）→ 2 次 task_done
-    # 在真实 asyncio.Queue 上，2 次 get + 2 次 task_done = 内部 counter 一致
-    # 如果有 bug（double task_done），第二次 task_done 会抛 ValueError
-    assert call_count['n'] == 2, f"execute should run 2 times, ran {call_count['n']}"
-    assert task_done_count['n'] == 2, (
-        f"task_done should be called 2 times, was called {task_done_count['n']} times"
+    # 重试已禁用：失败即终态 → execute 1 次、task_done 1 次
+    assert call_count['n'] == 1, f"execute should run 1 time (no-retry), ran {call_count['n']}"
+    assert task_done_count['n'] == 1, (
+        f"task_done should be called 1 time, was called {task_done_count['n']} times"
     )
     # 验证 queue 内部 unfinished_tasks 已归零（说明 task_done 配对正确）
     assert real_queue._unfinished_tasks == 0, (
@@ -379,7 +376,7 @@ def test_worker_max_retries_zero_fails_without_retry():
     assert call_count['n'] == 1, f"max_retries=0 应只执行 1 次,实际 {call_count['n']}"
     assert len(q.completed) == 1
     assert q.completed[0].status == TaskStatus.FAILED
-    assert q.completed[0].retry_count == 1
+    assert q.completed[0].retry_count == 0
     assert real_queue._unfinished_tasks == 0
 
 

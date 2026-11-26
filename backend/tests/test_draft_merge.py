@@ -17,12 +17,17 @@ from services.draft_merge import (
 # ===== DECLARATION_PLATFORMS =====
 
 def test_declaration_platforms_keys():
-    """8 个平台：xiaohongshu/douyin/kuaishou/bilibili/baijiahao/tencent_video/iqiyi + youtube。"""
+    """9 个平台：8 个基础平台 + dayu（2026-11 新增大鱼号，创作声明同 iqiyi）"""
     assert set(DECLARATION_PLATFORMS.keys()) == {
         'xiaohongshu', 'douyin', 'kuaishou',
         'bilibili', 'baijiahao', 'tencent_video', 'iqiyi',
-        'youtube',
+        'dayu', 'youtube',
     }
+
+
+def test_declaration_platforms_dayu_same_as_iqiyi():
+    """dayu 与 iqiyi 同用 creationDeclaration 字段"""
+    assert DECLARATION_PLATFORMS['dayu'] == 'creationDeclaration'
 
 
 def test_declaration_platforms_youtube_has_two_fields():
@@ -237,7 +242,8 @@ def test_validate_draft_youtube_missing_audience_or_altered(monkeypatch):
 
 
 def test_validate_draft_portrait_without_portrait_cover(monkeypatch):
-    """videoFormat=portrait 但缺竖版封面 → 报错。"""
+    """videoFormat=portrait 但缺竖版封面 → 不再报错（2cfa52d 移除强校验：
+    只传横版封面时自动兜底为竖版，与 /postVideo 行为一致）。"""
     _user_info_lookup_patch(monkeypatch, [FakeAccount(1, 'xiaohongshu', '/cookies/x1')])
     draft = _video_draft({
         'commonConfig': {'videoLandscape': {'id': 'v'}, 'videoPortrait': None,
@@ -250,7 +256,7 @@ def test_validate_draft_portrait_without_portrait_cover(monkeypatch):
         'publishAccountIds': [1],
     })
     errs = validate_draft_for_publish(draft)
-    assert any('竖版封面' in e or 'portrait' in e.lower() or 'cover' in e.lower() for e in errs)
+    assert not any('竖版封面' in e or 'portrait cover' in e.lower() for e in errs)
 
 
 def test_validate_draft_douyin_activity_tags_cap(monkeypatch):
@@ -401,14 +407,15 @@ def test_build_kwargs_cover_renames_to_landscape_portrait():
 
 
 def test_build_kwargs_video_chosen_by_videoformat():
-    """videoFormat=portrait 选 coverPortrait 视频，landscape 选 coverLandscape。"""
+    """视频文件横版优先（2cfa52d：不再按 videoFormat 区分横竖，
+    上传了即可发，实际方向由 materials.orientation 决定）。"""
     merged = {'videoFormat': 'portrait',
               'videoPortrait': {'stored_path': '/abs/port.mp4'},
               'videoLandscape': {'stored_path': '/abs/land.mp4'}}
     common = {}
     account = FakeAccountForBuild()
     kw = build_platform_kwargs(merged, common, account)
-    assert kw['files'] == ['/abs/port.mp4']
+    assert kw['files'] == ['/abs/land.mp4']
 
 
 def test_build_kwargs_video_falls_to_common():

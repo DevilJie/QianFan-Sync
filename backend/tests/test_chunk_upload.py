@@ -89,8 +89,12 @@ class TestChunkUpload(unittest.TestCase):
             if getattr(fn, '__name__', None) not in ('_ensure_db', '_ensure_materials_table')
         ]
         # patch DB_PATH 和 CHUNK_DIR 到测试目录
+        # （CHUNK_DIR 是 uploads_bp 的模块级常量，绑死于首次 import 时的
+        #   SAU_DATA_DIR；全量跑时 app 被更早的测试导入，必须显式 patch
+        #   才能摆脱导入顺序依赖）
         self._patches = [
             patch("blueprints.uploads_bp.BASE_DIR", Path(_tmpdir)),
+            patch("blueprints.uploads_bp.CHUNK_DIR", CHUNK_DIR),
             patch("blueprints.uploads_bp.DB_PATH", DB_PATH) if False else patch(
                 "blueprints.uploads_bp._get_db", self._patched_get_db
             ),
